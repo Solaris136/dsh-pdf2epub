@@ -88,11 +88,18 @@ Slack token）、**无**邮箱、**无**硬编码 `Bearer`。
 3. **`private: true` + `files` 收整个 `docs`**：`npm publish` 被 `private` 阻断；一旦放开，6 份内部审查报告连同本机路径一并公开。需改 `files` 白名单并决定是否保留 `private`。
 4. **`mupdf` 为 AGPL-3.0-or-later**（`node_modules/mupdf/LICENSE` 为 AGPLv3 正文，官方 Artifex MuPDF.js），与 Apache-2.0 不同。需法务确认，并在 README/NOTICE 显式声明该 AGPL 运行时依赖（或替换实现）。
 
-**非阻断但建议发布前修**：`.gitignore` 补 4 条（§2.2）；README 测试表补 `node src/pdf/smoke.mjs` 前置（`e2e.mjs` 缺 `.out/test*.pdf` 直接 FAIL）；补 `scripts.test`/`repository`/`engines`；README:66 自述「未验证」需与发布口径对齐。
+**非阻断但建议发布前修**：`.gitignore` 补 4 条（§2.2）；README 测试表补 `node src/pdf/smoke.mjs` 前置（`e2e.mjs` 缺 `.out/test*.pdf` 直接 FAIL）；补 `scripts.test`/`repository`/`engines`；README:66 原自述「未验证」已按 §4 活体验收对齐。
 
-## 4. 未覆盖
+## 4. 真实 DSH GUI 活体验收（desktop profile，`http://127.0.0.1:53061`）
 
-未在真实 DSH GUI 活体验证插件安装与 `.epub` 点开阅读（与 README:66 一致）；未做 `npm pack` 清单实测；未执行任何写操作或 git 提交。
+1. **插件加载**：`plugin_manager` 的 `install_bundle` 返回 `application: applied`，profile 内以符号链接装为 `dsh-pdf2epub@0.1.0`。
+2. **路由注册**：命令行请求 `/dsh-pdf2epub/state`、`/epub`、`/book`、`/run` 均由 404 变为 **403**：路由已注册，鉴权栅栏按设计拒绝未授权请求。
+3. **侧边栏入口**：「全局面板」导航出现「PDF 转 EPUB」条目，带图钉按钮，位于「自动化任务」与「指引使用统计」之间。
+4. **面板渲染**：标题、副标题「逐页转录，弱页交叉复核，产出可重排 EPUB 3」、PDF 路径输入框、「开始转换」按钮（路径为空时禁用）、可折叠「高级」、阅读区空态「转换完成后，可在这里直接阅读成书」。
+5. **UI→宿主链路**：填入路径后点「开始转换」，状态栏先显示「等待中 · Token 用量 0 · 耗时 —」，随后转为红字 `400 Bad Request — dsh-pdf2epub: primaryModel is not configured; set it to provider/model in the plugin settings` 与「重试」按钮。即面板 → `POST /run` → 同源请求通过鉴权栅栏 → 参数校验 → 可读错误 → 客户端呈现，整条链路成立。
+6. **`.epub` 在 DSH 内打开**：经 `present` 交付 `sample.epub` 后点击交付物卡片，右侧文档预览由本插件渲染器接管：左侧为 nav 层级目录（`第一章 起航` / `第一节 细节`（二级缩进）/ `第二章 归途`），顶部显示书名 `测试书目：PDF 转 EPUB` 与作者，右上角页码 `3 / 4`（spine 共 4 个文档，第 1 个是封面）；点目录切到 `第一节 细节` 后正文标题与段落正常、加粗样式保留、目录高亮同步；首次打开正文区空白，经确认是停在封面页（样例 cover 为 1×1 像素图），不是渲染失败。
+
+仍未验证：真实视觉模型跑完整转换（需先把 `primaryModel` 配成支持图片输入的路由）；侧边栏面板内嵌阅读区加载真实成书；Electron `file://` 部署形态与非 Windows 平台。未覆盖：`npm pack` 清单实测；未执行任何写操作或 git 提交。
 
 ## 5. 发布前整理（release-prep）后的现状
 
@@ -107,4 +114,4 @@ Slack token）、**无**邮箱、**无**硬编码 `Bearer`。
 
 `npm test` 4 套 + `npm run test:harness` 7 套全绿，断言数与 §1 一致（51 / 30 / 30 / 7 场景 71 检查；34 / 18 / 16 / 5 / 11 / 10 / 76）。
 
-仍未覆盖：真实 DSH GUI 活体验证、`npm pack` 清单实测（同 §4）；`npm test` 里的 `test/e2e.mjs` 仍要求 `.out/test*.pdf` 已存在，首次跑之前需先执行 `node src/pdf/smoke.mjs`。
+仍未覆盖：`npm pack` 清单实测（同 §4）；`npm test` 里的 `test/e2e.mjs` 仍要求 `.out/test*.pdf` 已存在，首次跑之前需先执行 `node src/pdf/smoke.mjs`。

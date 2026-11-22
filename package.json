@@ -1,0 +1,55 @@
+{
+  "name": "dsh-pdf2epub",
+  "version": "0.1.0",
+  "description": "Fully automatic PDF to EPUB 3 plugin for DeepSeek Harness: page-by-page vision-model transcription, multi-model cross review, semantic EPUB assembly, token accounting.",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Solaris136/dsh-pdf2epub.git"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "type": "module",
+  "icon": "./icon.svg",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg"
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "src",
+    "cordis.patch.yml",
+    "locale/*.json",
+    "docs",
+    "icon.svg",
+    "NOTICE"
+  ],
+  "scripts": {
+    "pretest": "node src/pdf/smoke.mjs",
+    "test": "node src/model/test.mjs && node src/epub/test.mjs && node src/epub/hardening.test.mjs && node test/e2e.mjs",
+    "test:harness": "node test/harness/host-check.mjs && node test/harness/epub-route-check.mjs && node test/harness/client-check.mjs && node test/harness/locale-check.mjs && node test/harness/preview-check.mjs && node test/harness/route-path.mjs && node test/harness/security-check.mjs"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-conversation"
+      ]
+    }
+  },
+  "dependencies": {
+    "fflate": "^0.8.3",
+    "mupdf": "^1.28.6"
+  },
+  "devDependencies": {
+    "saxes": "^6.0.0"
+  }
+}

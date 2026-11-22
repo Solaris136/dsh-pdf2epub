@@ -1,0 +1,19 @@
+dsh-pdf2epub
+Copyright 2026 Solaris136
+
+This product is licensed under the Apache License, Version 2.0.
+
+Third-party components installed as npm dependencies are NOT covered by
+this license and keep their own terms:
+
+  - mupdf (MuPDF.js), copyright Artifex Software, Inc.
+    Licensed under the GNU Affero General Public License v3.0 or later.
+    https://github.com/ArtifexSoftware/mupdf.js
+
+Because this plugin depends on an AGPL-3.0 component, anyone who distributes
+a bundle that contains mupdf must comply with the AGPL. This repository
+contains no mupdf source or binary; it is installed by the user with
+`npm install`.
+
+  - fflate, MIT License.
+  - saxes (development only), ISC License.

@@ -1,0 +1,20 @@
+node_modules/
+*.log
+.DS_Store
+Thumbs.db
+
+# Local run artifacts
+.out/
+.work/
+runs/
+pdf2epub-out/
+*.epub
+!docs/*.epub
+
+# Conversion inputs and outputs that leak into the tree
+*.pdf
+*.book.json
+*.report.json
+
+# Internal review / research notes (never published)
+notes/

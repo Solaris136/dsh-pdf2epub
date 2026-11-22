@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64" role="img" aria-label="pdf2epub">
+  <rect x="4" y="8" width="26" height="40" rx="3" fill="#c0392b" opacity="0.92"/>
+  <path d="M14 20h7M14 26h9M14 32h6" stroke="#fff" stroke-width="2.2" stroke-linecap="round"/>
+  <path d="M36 32h14m0 0-5-5m5 5-5 5" stroke="#247bbf" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>
+  <rect x="42" y="14" width="18" height="34" rx="3" fill="#247bbf" opacity="0.92"/>
+  <path d="M48 22h6M48 28h6M48 34h6M48 40h4" stroke="#fff" stroke-width="2.2" stroke-linecap="round"/>
+</svg>

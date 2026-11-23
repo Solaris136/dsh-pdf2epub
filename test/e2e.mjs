@@ -173,6 +173,15 @@
  * pure numbers only, so `回历九一七年 175b (公元 1511 年)` loses its leaf mark
  * while `公元 1529 年 9 月 7 日` on the same page keeps every digit.
  *
+ * (bg) pins where a page-bottom footnote goes. A note is printed under the last
+ * line of its page, so keeping it in the flow leaves it in the middle of the
+ * sentence the next page continues - 《巴布尔回忆录》 p. 21 read `…山发现带有白` |
+ * ① | `色和红色纹理…` as two paragraphs. With the default `footnotePlacement:
+ * "chapter"` the two halves are sewn back into one paragraph, the note is
+ * collected in an endnotes section that closes the chapter, and the marker in the
+ * text and the number in the list link to each other; `footnoteLinks: false`
+ * keeps the list and drops the links. (u) still pins the `inline` renderer.
+ *
  *   node test/e2e.mjs
  *
  * Artifacts land in `.out/e2e/`; the process exits 1 when any scenario fails.
@@ -2364,7 +2373,10 @@ async function scenarioFootnoteAndFolio() {
   const host = createFakeHost({ footnoteAndFolio: true })
   const run = await pipeline.runConversion({
     host,
-    spec: { input: SHORT_PDF, outputDir: outDir },
+    // `inline` on purpose: this scenario pins the renderer for a reader whose
+    // footnote popup wants the note in the flow. The default - notes collected at
+    // the end of the chapter - is scenario (bg).
+    spec: { input: SHORT_PDF, outputDir: outDir, footnotePlacement: 'inline' },
     config: { primaryModel: PRIMARY, reviewModels: [], dpi: 100, concurrency: 1 },
   })
   state.epubs.push(run.epubPath)
@@ -4933,6 +4945,145 @@ async function scenarioPureDateKeptLeafMarkRemoved() {
     + `sentence=${/回历九一七年[^夺]{0,20}/.exec(page)?.[0] ?? '(not found)'}`
 }
 
+/**
+ * (bg) 脚注统一收在章末，被打断的段落重新接上.
+ *
+ * The pilot book's most disruptive defect, and the one a reader cannot repair by
+ * reflowing: a page-bottom footnote is printed under the last line of its page, so
+ * the note lands in the middle of a sentence the next page continues -
+ * `…山发现带有白` | ① | `色和红色纹理…`. Two things have to hold for the finished
+ * book: the two halves must be one paragraph again (the note is a page break, not
+ * a paragraph boundary), and the note must be collected in an endnotes section at
+ * the end of its chapter with both directions linked.
+ */
+async function scenarioEndnotesCollectedAtChapterEnd() {
+  const pdf = await manyPagePdf()
+  const outDir = path.join(E2E_DIR, 'endnotes')
+  const host = createFakeHost({
+    blocksByPage: {
+      1: [
+        { type: 'p', text: '在乌马尔·沙黑·米儿咱的晚年①，巴拉·库赫山发现带有白' },
+        { type: 'footnote', text: '① 舒勒《突厥斯坦》谓费尔干纳谷地长约160英里。' },
+      ],
+      2: [
+        { type: 'p', text: '色和红色纹理的石头。这是很好的石头。' },
+        { type: 'p', text: '还有一段没有脚注的正文。' },
+      ],
+    },
+  })
+  const run = await pipeline.runConversion({
+    host,
+    spec: { input: pdf, outputDir: outDir, pages: '1-2' },
+    config: { primaryModel: PRIMARY, reviewModels: [], dpi: 72, concurrency: 1 },
+  })
+  state.epubs.push(run.epubPath)
+
+  const chapter = strFromU8(unzip(await readFile(run.epubPath))['OEBPS/text/ch001.xhtml'])
+  // 1. the paragraph is whole: 白色 is one word again
+  expectTrue('(bg) 被脚注打断的段落接回「带有白色和红色纹理」',
+    chapter.includes('巴拉·库赫山发现带有白色和红色纹理的石头。'), { detail: shorten(chapter) })
+  // 2. the note left the flow
+  expectTrue('(bg) 正文里没有 <aside> 脚注', !chapter.includes('<aside'), { detail: shorten(chapter) })
+  // 3. it is collected at the end of the chapter, after the prose
+  expectTrue('(bg) 章末有 endnotes section',
+    chapter.includes('<section class="endnotes" epub:type="endnotes" role="doc-endnotes">'),
+    { detail: shorten(chapter) })
+  expectTrue('(bg) 注文整段都在章末',
+    chapter.includes('舒勒《突厥斯坦》谓费尔干纳谷地长约160英里。'), { detail: shorten(chapter) })
+  expectTrue('(bg) section 在所有正文之后',
+    chapter.indexOf('<section') > chapter.lastIndexOf('还有一段没有脚注的正文。'),
+    { detail: shorten(chapter) })
+  // 4. both directions are linked
+  expectTrue('(bg) 正文标记是 noteref',
+    /<a class="noteref" id="fnref1" href="#fn1"[^>]*>①<\/a>/.test(chapter), { detail: shorten(chapter) })
+  expectTrue('(bg) 注文序号是 backlink',
+    /<a class="noteback" href="#fnref1"[^>]*>①<\/a>/.test(chapter), { detail: shorten(chapter) })
+
+  // 5. `footnoteLinks: false` keeps the list and drops the links
+  const unlinked = await pipeline.runConversion({
+    host,
+    spec: { input: pdf, outputDir: path.join(E2E_DIR, 'endnotes-plain'), pages: '1-2', footnoteLinks: false },
+    config: { primaryModel: PRIMARY, reviewModels: [], dpi: 72, concurrency: 1 },
+  })
+  state.epubs.push(unlinked.epubPath)
+  const plain = strFromU8(unzip(await readFile(unlinked.epubPath))['OEBPS/text/ch001.xhtml'])
+  expectTrue('(bg) footnoteLinks=false 时不生成 noteref', !plain.includes('noteref'), { detail: shorten(plain) })
+  expectTrue('(bg) footnoteLinks=false 时注文仍在章末',
+    plain.includes('<section class="endnotes"') && plain.includes('① 舒勒'), { detail: shorten(plain) })
+
+  note(`(bg) 段落接回=${chapter.includes('带有白色和红色')} `
+    + `| aside=${chapter.includes('<aside')} | section=${chapter.includes('<section class="endnotes"')}`)
+
+  return `sewn=${chapter.includes('带有白色和红色')} | aside=${chapter.includes('<aside')} `
+    + `| noteref=${chapter.includes('noteref')} | plain=${!plain.includes('noteref')}`
+}
+
+/**
+ * (bh) 被当成标题的句子尾巴接回段落.
+ *
+ * 《巴布尔回忆录》 p. 60: one sentence printed across a page break, whose second
+ * half the model set apart on the new page and reported as an `h3` -
+ * `…他真是` | `h3 一个勇士！`. The text was right, the TYPE was wrong, and the
+ * book showed a paragraph stopping mid-word with a bold fragment under it. A
+ * heading is a label, so a block ending in sentence punctuation that stands
+ * directly after a paragraph the page break left unfinished is prose: it has to
+ * be sewn back, must not open a chapter, and must be counted so a QC pass can see
+ * it happened.
+ */
+async function scenarioHeadingThatIsProse() {
+  const pdf = await manyPagePdf()
+  const outDir = path.join(E2E_DIR, 'prose-heading')
+  const host = createFakeHost({
+    blocksByPage: {
+      1: [{ type: 'p', text: '他们终于进行了角力，札尼·伯克把他摔倒了。他真是' }],
+      2: [
+        { type: 'h3', text: '一个勇士！' },
+        { type: 'p', text: '札尼·伯克是一个巨人。' },
+      ],
+    },
+  })
+  const run = await pipeline.runConversion({
+    host,
+    spec: { input: pdf, outputDir: outDir, pages: '1-2' },
+    config: { primaryModel: PRIMARY, reviewModels: [], dpi: 72, concurrency: 1 },
+  })
+  state.epubs.push(run.epubPath)
+
+  const chapter = strFromU8(unzip(await readFile(run.epubPath))['OEBPS/text/ch001.xhtml'])
+  expectTrue('(bh) 句子接成「他真是一个勇士！」',
+    chapter.includes('他真是一个勇士！'), { detail: shorten(chapter) })
+  expectTrue('(bh) 正文里没有孤立的「一个勇士！」标题',
+    !/<h[1-6]>\s*一个勇士！\s*<\/h[1-6]>/.test(chapter), { detail: shorten(chapter) })
+  expect('(bh) 计入 stats.headingsAsProse', run.report.stats.headingsAsProse, 1)
+  expect('(bh) 只算散文标题，不算书眉降级', run.report.stats.demotedHeadings, 0)
+
+  // Control: a numbered section title after a line ending in `)` stays a heading.
+  const kept = await pipeline.runConversion({
+    host: createFakeHost({
+      blocksByPage: {
+        1: [{ type: 'p', text: '他从十一岁以后从未在同一个地方两次封斋。(见本书，f.330)' }],
+        2: [
+          { type: 'h3', text: '三、蒙兀儿人的事务' },
+          { type: 'p', text: '正文。' },
+        ],
+      },
+    }),
+    spec: { input: pdf, outputDir: path.join(E2E_DIR, 'prose-heading-control'), pages: '1-2' },
+    config: { primaryModel: PRIMARY, reviewModels: [], dpi: 72, concurrency: 1 },
+  })
+  state.epubs.push(kept.epubPath)
+  const control = strFromU8(unzip(await readFile(kept.epubPath))['OEBPS/text/ch001.xhtml'])
+  expectTrue('(bh) 编号小节标题不被当成句子', control.includes('<h3>三、蒙兀儿人的事务</h3>'),
+    { detail: shorten(control) })
+  expect('(bh) 对照运行 headingsAsProse 为 0', kept.report.stats.headingsAsProse, 0)
+
+  note(`(bh) 接回=${chapter.includes('他真是一个勇士！')} `
+    + `| 无孤立标题=${!/<h[1-6]>\s*一个勇士！/.test(chapter)} `
+    + `| 编号标题保留=${control.includes('三、蒙兀儿人的事务')}`)
+
+  return `joined=${chapter.includes('他真是一个勇士！')} | numbered kept=${control.includes('三、蒙兀儿人的事务')}`
+}
+
 /* ------------------------------------------------------------------ *
  * runner
  * ------------------------------------------------------------------ */
@@ -4995,6 +5146,8 @@ const SCENARIOS = [
   ['(bd) 书眉伪章被并回前一章', scenarioRunningHeadWithoutOwnHeaderDemoted],
   ['(be) 年章标题不会被误降级', scenarioYearChapterTitlesKept],
   ['(bf) 纯数字日期仍受保护、带字母叶码被清除', scenarioPureDateKeptLeafMarkRemoved],
+  ['(bg) 脚注收进章末、被打断的段落接回', scenarioEndnotesCollectedAtChapterEnd],
+  ['(bh) 被当成标题的句子尾巴接回段落', scenarioHeadingThatIsProse],
 ]
 
 async function main() {

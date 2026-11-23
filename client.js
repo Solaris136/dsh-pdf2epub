@@ -12,12 +12,17 @@
  *
  * Everything the browser asks the Host for is plain same-origin HTTP, because a
  * hand-written client cannot mount a `ctx.remote` namespace without Typert
- * codegen (contract §9). The four routes match `src/host/server.js`:
+ * codegen (contract §9). The five routes match `src/host/server.js`:
  *   POST /dsh-pdf2epub/run             { input, model?, reviewModels?, dpi?, concurrency? } -> { jobId }
  *   GET  /dsh-pdf2epub/state?jobId=... -> { jobId, phase, page, total, tokens, bookJsonPath, error }
+ *   GET  /dsh-pdf2epub/models          -> { default, groups: [{ id, name, models }], failures }
  *   GET  /dsh-pdf2epub/book?path=...   -> { title, author, language, chapters: [{ id, title, level, html }] }
  *   GET  /dsh-pdf2epub/epub?sessionId=<sid>&path=<path>
  *                                      -> { ok, title, author, language, toc, chapters, css, images }
+ *
+ * `GET /models` is what feeds the 「模型」 dropdown: it is the built-in model
+ * picker's own catalogue, served by the Host because that namespace is not
+ * mountable here.
  *
  * `sessionId` is what makes the preview work: the address the body receives
  * carries the *workspace-relative* tail of a file the reader clicked, and the
@@ -46,6 +51,7 @@ const LOCALE_NS = 'pdf2epub'
 
 const RUN_PATH = '/dsh-pdf2epub/run'
 const STATE_PATH = '/dsh-pdf2epub/state'
+const MODELS_PATH = '/dsh-pdf2epub/models'
 const BOOK_PATH = '/dsh-pdf2epub/book'
 const EPUB_PATH = '/dsh-pdf2epub/epub'
 
@@ -1641,8 +1647,10 @@ function readModelCatalog(value) {
  * @returns {Promise<{ phase: string, groups: object[], defaultRoute: string }>} view.
  */
 async function fetchModelCatalog(ctx) {
+  const served = await fetchServedCatalog()
+  if (served.phase !== 'failed') return served
   const api = modelCatalogRemote(ctx)
-  if (api === null) return { phase: 'failed', groups: [], defaultRoute: '' }
+  if (api === null) return served
   try {
     // RemoteResult: `{ ok: true, value }` / `{ ok: false, error }`.
     const catalog = readModelCatalog(remoteValue(await api.modelCatalog(), 'model catalog unavailable'))
@@ -1650,8 +1658,34 @@ async function fetchModelCatalog(ctx) {
       return { phase: 'empty', groups: [], defaultRoute: '' }
     }
     return { phase: 'ready', groups: catalog.groups, defaultRoute: catalog.defaultRoute }
-  } catch {
-    return { phase: 'failed', groups: [], defaultRoute: '' }
+  } catch (error) {
+    const reason = typeof served.reason === 'string' && served.reason !== '' ? served.reason : messageOf(error)
+    return { phase: 'failed', groups: [], defaultRoute: '', reason }
+  }
+}
+
+/**
+ * Read the catalogue from this plugin's own Host route.
+ *
+ * The generated `ctx.remote.session.modelCatalog()` namespace only exists for a
+ * bundle that declares the API dependency; a hand-written client cannot, so the
+ * Host serves the same wire `ModelCatalog` under {@link MODELS_PATH} and that
+ * route is read first. The Remote probe above stays as the fallback for a Host
+ * that predates the route.
+ *
+ * @returns {Promise<{ phase: string, groups: object[], defaultRoute: string, reason?: string }>}
+ *   the view; `phase: 'failed'` means "ask the Remote next", and carries why the
+ *   route refused so the panel can say it if nothing else answers.
+ */
+async function fetchServedCatalog() {
+  try {
+    const catalog = readModelCatalog(await requestJson(MODELS_PATH, { cache: 'no-store' }))
+    if (catalog === null || catalog.groups.length === 0) {
+      return { phase: 'empty', groups: [], defaultRoute: '', reason: '' }
+    }
+    return { phase: 'ready', groups: catalog.groups, defaultRoute: catalog.defaultRoute }
+  } catch (error) {
+    return { phase: 'failed', groups: [], defaultRoute: '', reason: messageOf(error) }
   }
 }
 
@@ -3316,13 +3350,18 @@ loader.load({
           // a stale selection) lands on 「自定义…」 rather than on a `select` that
           // has no matching option.
           const customActive = ready && (modelSource === 'custom' || (model !== '' && !routes.has(model)))
+          // Why the catalogue is unavailable is worth a line: free text is the
+          // only other control there, and a bare "unavailable" cannot be acted
+          // on. The reason is clipped, because a Host may refuse with a sentence.
+          const reason = typeof modelCatalog.reason === 'string' ? modelCatalog.reason.trim() : ''
+          const detail = reason === '' ? '' : ` — ${reason.length > 160 ? `${reason.slice(0, 157)}…` : reason}`
           const note = ready
             ? ''
             : modelCatalog.phase === 'loading'
               ? t('panel.modelLoading')
               : modelCatalog.phase === 'empty'
                 ? t('panel.modelEmpty')
-                : t('panel.modelFallback')
+                : `${t('panel.modelFallback')}${detail}`
 
           /** Free-text route input: the fallback, and the 「自定义…」 editor. */
           const routeInput = () => h('input', {

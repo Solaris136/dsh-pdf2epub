@@ -65,7 +65,9 @@ flowchart TD
 | `maxTokens` | integer | `4000` | 512–16000 | 单页转录的输出上限 |
 | `concurrency` | integer | `4` | 1–16 | 同时转录的页数（每批前 3 页仍顺序跑） |
 | `splitLevel` | integer | `2` | 1–6 | 从哪级标题开始新章节 |
-| `language` | string | `zh-CN` | — | 写入 EPUB 的语言标记 |
+| `footnotePlacement` | chapter / inline | `chapter` | — | 页脚注的去处：`chapter` 收进本章末尾的「注释」小节，正文标记与注文双向链接；`inline` 保留原位置，就地渲染成 `<aside>` |
+| `footnoteLinks` | boolean | `true` | — | 仅 `chapter` 生效：正文标记 ↔ 注文序号互链；关掉后两侧都只是普通字符 |
+| `language` | string | `zh-CN` | — | 写入 EPUB 的语言标记；也是注释小节标题的语言（中文「注 释」，其他 `Notes`） |
 | `outputDir` | string | 空（PDF 所在目录） | — | 产物根目录，不存在会自动创建 |
 
 数值经 `index.js` 归一化后再由 pipeline clamp 一次；传无法转成数字的值时落到区间下界。
@@ -85,6 +87,8 @@ flowchart TD
 | `maxTokens` | number | 单页输出上限，512–16000 |
 | `concurrency` | number | 同时转录页数，1–16 |
 | `splitLevel` | number | 切章标题级别，1–6 |
+| `footnotePlacement` | string | `chapter` / `inline`，覆盖 `footnotePlacement`；见下面「脚注怎么放」 |
+| `footnoteLinks` | boolean | 覆盖 `footnoteLinks`：`false` 时不生成任一次跳转 |
 | `pages` | string | 要转换的页，语法 `"1-5,31-35,73"`（1 起、逗号分隔、闭区间）；省略即全书 |
 | `excludePages` | string | 要排除的页，语法同 `pages`；在 `pages` 之后生效（`pages: "1-3"` + `excludePages: "2"` 只转 1、3） |
 | `cover` | boolean | 用第 1 页渲染封面 PNG（长边约 1400px）并声明为包封面；默认关 |
@@ -93,6 +97,17 @@ flowchart TD
 
 返回 `ok`、`epubPath`、`reportPath`、`bookJsonPath`、`pages`、`chapters`、`tokens{input,output,total}`、`degradedPages`。两个入口走同一条 `runConversion`，缓存、进度和报告一致；面板走后台作业（`POST /dsh-pdf2epub/run` 起作业，`GET /state` 读进度，`GET /book`、`GET /file` 读产物，`GET /epub` 解包任意 `.epub`）。页数硬上限 5000。
 
+## 脚注怎么放
+
+纸上的页脚注印在**这一页最后一行下面**，而重排后没有"页"了：注文留在原地，就等于插在下一页接着写的那句话中间。真实样张（《巴布尔回忆录》第 21 页）读出来是 `…巴拉·库赫山发现带有白` | `① 舒勒《突厥斯坦》…` | `色和红色纹理的石头。`——一段话被劈成两半，中间还夹着一条注。
+
+所以默认 `footnotePlacement: "chapter"`，做三件事：
+
+1. **接回被劈开的段落**。页脚注不是段落边界，跨过它把两半缝回去（`flattenPages` 把 `footnote` 当作可以跨越的空隙，和页边页码同等对待）；跨页被劈成两截的同一条注也接回成一条。
+2. **整章收口**。一章的所有注文按印刷顺序收进章末一个 `<section class="endnotes" epub:type="endnotes" role="doc-endnotes">`，标题按 `language` 取「注 释」或 `Notes`。正文里不再出现 `<aside>`，读者读到的正文从头到尾是完整的。
+3. **双向链接**。正文里的 `①` 变成 `<a class="noteref" href="#fn1" epub:type="noteref">`，注文开头的 `①` 变成 `<a class="noteback" href="#fnref1" epub:type="backlink">`。配对靠**字符相等 + 出现顺序**，不靠位置：纸上一页的编号从 `①` 重新数，整章里 `①` 会出现十几次，只有顺序能区分。找不到标记的注（转录时标记丢了，或 `＊` 这类无编号注）照样列出，只是那一侧不带链接。
+
+`footnotePlacement: "inline"` 保留旧行为，把注文就地渲染成 `<aside class="footnote" epub:type="footnote">`，适合只想弹出脚注、不想跳到章末的阅读器。`footnoteLinks: false` 则保留章末小节但不生成任何跳转，适合正文里所有 `<a>` 都会被染色的阅读器。
 ## 分批转写大书
 
 `pages` / `excludePages` 是分批的基础：不在选择里的页既不会渲染也不会送模型，也不进 EPUB。页缓存**不含**页选择，缓存键是「这本书的第 N 页 + 这套设置」，所以
@@ -130,14 +145,14 @@ pages: "1-40"  →  pages: "41-80"  →  …  →  pages: "1-764"
 | `book` | `title` / `author?` / `publisher?` / `language` / `pages` / `pagesSelected` / `chapters` / `cover` / `directory` / `outputName` / `alongsideInput`（`author`、`publisher` 缺失时 JSON 直接不出现该键） |
 | `selection` | 全书运行时为 `null`；否则 `{ pages, excludePages, resolved: [...] }`，把批次报告对应回请求 |
 | `models` | `primary` 与 `reviewers[]`，均为 `provider/model` |
-| `stats` | `pagesTranscribed` / `pagesFromTextLayer` / `pagesCrossReviewed` / `pagesDegraded` / `pagesFailed` / `pagesBlank` / `pagesEmpty` / `pagesUnparsable` / `pagesTransportFailed` / `pagesReasoningBudget` / `blocks` / `blocksDropped` / `demotedHeadings` / `blocksJoined` / `blocksRejectedJoins` / `chapters` / `figuresExtracted` |
+| `stats` | `pagesTranscribed` / `pagesFromTextLayer` / `pagesCrossReviewed` / `pagesDegraded` / `pagesFailed` / `pagesBlank` / `pagesEmpty` / `pagesUnparsable` / `pagesTransportFailed` / `pagesReasoningBudget` / `blocks` / `blocksDropped` / `demotedHeadings` / `headingsAsProse` / `blocksJoined` / `blocksRejectedJoins` / `chapters` / `figuresExtracted` |
 | `tokens` | `input` / `output` / `cached` / `cacheWrite` / `reasoning` / `total` / `calls` / `estimated` / `reused` / `byPage[]`。`cached`/`cacheWrite` 是模型侧提示词缓存，与页缓存无关；页缓存省下的历史消耗在 `reused`（未实际发生的消耗）；`byPage[].cached` 标出本次没花钱的页 |
 | `rendering` | `requestedDpi` / `effectiveDpi` / `maxEffectiveDpi` / `note` |
 | `timing` | `totalMs` |
 | `warnings` | 字符串数组，见下 |
 | `pages` | 逐页，见下 |
 
-`stats.pagesFailed` 统计没产出正文的页（空块、带 `error`、只剩页眉页脚），不是「调用抛异常」。`pagesBlank` 是真空白页（实测墨迹低于页面 0.5%），不计失败、也不进 `pagesEmpty`。`demotedHeadings` 是被判定为书眉而丢弃的 `h1`/`h2` 数（判据见 DESIGN 的质量闸门表：同页有同名 `header`，或与同层已开章同名且该文本出现在全书书眉里），缺陷被识别而不是被静默吞掉。`figuresExtracted` 是真正嵌入的图片数，只有图注的图不算。
+`stats.pagesFailed` 统计没产出正文的页（空块、带 `error`、只剩页眉页脚），不是「调用抛异常」。`pagesBlank` 是真空白页（实测墨迹低于页面 0.5%），不计失败、也不进 `pagesEmpty`。`demotedHeadings` 是被判定为书眉而丢弃的 `h1`/`h2` 数（判据见 DESIGN 的质量闸门表：同页有同名 `header`，或与同层已开章同名且该文本出现在全书书眉里），缺陷被识别而不是被静默吞掉。`headingsAsProse` 是被识破的「伪标题」数：某一句被页断劈开、后半句在新页上被排版成独立一行，模型就把它报成 `h2`/`h3`（`…他真是` | `一个勇士！`），这类块结尾带句末标点、前面又是没写完的段落，判定后接回上一段而不是当标题（判据见 DESIGN 质量闸门表）。`figuresExtracted` 是真正嵌入的图片数，只有图注的图不算。
 
 `warnings` 里可能出现的几类：页失败的汇总句（最多列 10 个页码 + 归因，并说明失败页没进缓存、重跑会重试）、推理预算专用建议、逐条插图裁切回落、路径类（旧缓存迁移、封面落盘失败、封面渲染失败），以及「未产出书」那份报告独有的一句声明。
 
@@ -181,8 +196,8 @@ npm run test:harness # 宿主路由 / 客户端 / 预览 / 模型选择 / 文件
 npm run check        # 静态检查 + npm pack 清单（不联网、不发模型调用）
 ```
 
-`npm test`：`src/model/test.mjs`（51）、`src/epub/test.mjs`（30）、`src/epub/hardening.test.mjs`（30）、`test/e2e.mjs`（58 场景 550 检查）。
-`npm run test:harness`：`host-check`（43）、`epub-route-check`（18）、`client-check`（16）、`locale-check`（5）、`preview-check`（11）、`route-path`（10）、`security-check`（76，本机无 Edge/Chrome 时浏览器层 SKIP；设置 `PDF2EPUB_REQUIRE_BROWSER=1` 则找不到浏览器即失败）、`model-select-check`、`picker-check`（后两者只打印 OK，不打条数）。脚本在 `test/harness/`，产物写 `.out/`（已 gitignore）；需要样例书的脚本用 `src/epub/build.js` 运行时自建。`pretest`（`node src/pdf/smoke.mjs`）生成 e2e 需要的 `.out/test.pdf` 与 `.out/test-long.pdf`。
+`npm test`：`src/model/test.mjs`（64）、`src/epub/test.mjs`（30）、`src/epub/hardening.test.mjs`（30）、`test/e2e.mjs`（60 场景 565 检查）。
+`npm run test:harness`：`host-check`（44）、`epub-route-check`（18）、`client-check`（16）、`locale-check`（5）、`preview-check`（11）、`route-path`（10）、`security-check`（76，本机无 Edge/Chrome 时浏览器层 SKIP；设置 `PDF2EPUB_REQUIRE_BROWSER=1` 则找不到浏览器即失败）、`model-select-check`、`picker-check`（后两者只打印 OK，不打条数）。脚本在 `test/harness/`，产物写 `.out/`（已 gitignore）；需要样例书的脚本用 `src/epub/build.js` 运行时自建。`pretest`（`node src/pdf/smoke.mjs`）生成 e2e 需要的 `.out/test.pdf` 与 `.out/test-long.pdf`。
 `npm run check`：`test/ci/check-static.mjs` 用 `node --check` 解析全部 29 个 JS 模块，校验两个 locale 的键与占位符对齐、`package.json` / `index.js` / `cordis.patch.yml` / 锁文件四处身份一致、`exports` 与 `files` 条目落盘存在；`test/ci/check-package.mjs` 读 `npm pack --dry-run` 的真实清单，要求 17 个运行时条目在包里且不混入 `notes/`、`test/`、`.github/`、`.out/`、PDF/EPUB 产物。
 
 ## 持续集成与合并门禁

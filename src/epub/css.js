@@ -173,6 +173,47 @@ caption {
   vertical-align: super;
 }
 
+/* ---------- chapter-end notes ---------- *
+ * What the "chapter" footnote placement produces: every page-bottom note of a
+ * chapter collected behind one rule at its end, so a note can no longer stand in
+ * the middle of the sentence the next page continues. The circled number a note
+ * opens with is the way back to the text, and the marker in the text is the way
+ * forward; both keep the book's own colour, because a circled number is already
+ * an unmistakable link target and colouring it turns every other paragraph blue. */
+.endnotes {
+  margin: 2.2em 0 0;
+  padding-top: 0.8em;
+  border-top: 1px solid #bbbbbb;
+  font-size: 0.86em;
+  line-height: 1.6;
+  text-indent: 0;
+}
+
+.endnotes-title {
+  margin: 0 0 0.7em;
+  font-size: 1em;
+  font-weight: 700;
+  letter-spacing: 0.2em;
+  text-indent: 0;
+}
+
+.endnote {
+  margin: 0 0 0.55em;
+  text-indent: 0;
+}
+
+.endnote p {
+  margin: 0;
+  text-indent: 0;
+  text-align: justify;
+}
+
+a.noteref,
+a.noteback {
+  color: inherit;
+  text-decoration: none;
+}
+
 .verse {
   margin: 0.8em 0;
   padding-left: 1em;

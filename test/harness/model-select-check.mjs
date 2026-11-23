@@ -1,8 +1,11 @@
 // Self-check for the panel's 「模型」 dropdown in client.js.
 //
 // The model field used to be a free-text input. It is now a `<select>` built
-// from `ctx.get('remote').session.modelCatalog()` — the built-in model picker's
-// own source (`notes/model-catalog.md` §1.1) — with two hard rules:
+// from `GET /dsh-pdf2epub/models` — the Host's own copy of the built-in model
+// picker's catalogue (`sessionController.modelCatalog()`), because a hand-written
+// client cannot mount the generated `ctx.remote.session` namespace — with the
+// Remote probe kept as the fallback for a Host that predates the route. Two hard
+// rules survive either source:
 //
 //   1. the catalogue only lists routes that are routable *right now* (no
 //      credentials means no group), so the original text input stays as the
@@ -28,6 +31,9 @@ const CLIENT = 'client.js'
 const SOURCE = readFileSync(path.join(ROOT, CLIENT), 'utf8')
 const ZH = JSON.parse(readFileSync(path.join(ROOT, 'locale/zh-CN.json'), 'utf8'))
 const EN = JSON.parse(readFileSync(path.join(ROOT, 'locale/en-US.json'), 'utf8'))
+
+/** The Host route the panel reads its catalogue from. */
+const MODELS_PATH = '/dsh-pdf2epub/models'
 
 const results = []
 const check = (label, fn) => {
@@ -145,9 +151,30 @@ function elementsOf(tree, tag) {
 }
 
 /**
+ * One fake HTTP answer for the panel's `fetch`.
+ *
+ * @param {{ status?: number, body?: unknown }} spec - status (2xx by default) and JSON body.
+ * @returns {object} the subset of `Response` `requestJson` reads.
+ */
+function reply(spec) {
+  const status = spec.status ?? 200
+  const ok = status >= 200 && status < 300
+  return {
+    ok,
+    status,
+    statusText: ok ? 'OK' : 'Error',
+    text: async () => JSON.stringify(spec.body ?? {}),
+  }
+}
+
+/**
  * Load client.js in a fresh context.
  *
- * @param {{ session?: object }} [options] - the `remote.session` namespace stub;
+ * @param {object} [options] - HTTP and service stubs.
+ * @param {{ status?: number, body?: unknown }} [options.models] - the answer
+ *   `GET /dsh-pdf2epub/models` gives; the wire catalogue by default, so the
+ *   dropdown is the normal case and the failing states are opt-in.
+ * @param {object} [options.session] - the `remote.session` namespace stub;
  *   omitted means "this page has no `remote` service at all".
  */
 function boot(options = {}) {
@@ -163,13 +190,10 @@ function boot(options = {}) {
     },
     document: { documentElement: {} },
     fetch: async (url, init) => {
-      runs.push({ url: String(url), init })
-      return {
-        ok: true,
-        status: 200,
-        statusText: 'OK',
-        text: async () => JSON.stringify({ jobId: 'job-model-1' }),
-      }
+      const target = String(url)
+      runs.push({ url: target, init })
+      if (target === MODELS_PATH) return reply(options.models ?? { body: CATALOG })
+      return reply({ body: { jobId: 'job-model-1' } })
     },
     setTimeout,
     clearTimeout,
@@ -227,7 +251,7 @@ function render(instance, input = 'C:\\Work\\book.pdf') {
  * Boot, run the mount-once effect (theme probe + catalogue read), and wait for
  * the Remote call to settle.
  *
- * @param {{ session?: object }} options - boot options.
+ * @param {object} [options] - boot options (HTTP stubs).
  * @returns {Promise<object>} the settled instance.
  */
 async function settle(options) {
@@ -277,7 +301,7 @@ function lastRunBody(instance) {
 
 /* ------------------------------------- 1. the catalogue renders a dropdown */
 
-const ready = await settle({ session: { modelCatalog: async () => ({ ok: true, value: CATALOG }) } })
+const ready = await settle()
 const tree = render(ready)
 
 check('1a. two groups render one <select> with models + 2 options', () => {
@@ -336,16 +360,12 @@ check('2. the picked model reaches the Host as provider/model', () => {
   assert.equal('reviewModels' in body, false, 'the request body must not carry reviewModels')
 })
 
-/* ----------------------------------- 3. a throwing Remote keeps the panel */
+/* --------------------- 3. the route is the source, the Remote the fallback */
 
-const broken = await settle({
-  session: {
-    modelCatalog() { throw new Error('model catalog bridge is not reachable') },
-  },
-})
+const broken = await settle({ models: { status: 503, body: { error: 'catalogue unavailable' } } })
 const brokenTree = render(broken)
 
-check('3. a failed catalogue falls back to the text input and does not crash', () => {
+check('3a. a failing catalogue route falls back to the text input and does not crash', () => {
   assert.equal(elementsOf(brokenTree, 'select').length, 0, 'no dropdown without a catalogue')
   const input = modelTextInput(brokenTree)
   assert.ok(input !== undefined, 'the original text input must remain the fallback')
@@ -358,9 +378,31 @@ check('3. a failed catalogue falls back to the text input and does not crash', (
   assert.equal(broken.react.slots[2], 'relay/manual-gpt-4o', 'typing must own the value')
 })
 
+const remoteBacked = await settle({
+  models: { status: 503, body: { error: 'catalogue unavailable' } },
+  session: { modelCatalog: async () => ({ ok: true, value: CATALOG }) },
+})
+const remoteTree = render(remoteBacked)
+
+check('3b. a Host without the route still gets the dropdown from the Remote', () => {
+  assert.equal(elementsOf(remoteTree, 'select').length, 1, 'the Remote probe is the fallback source')
+  assert.equal(elementsOf(remoteTree, 'option').length, TOTAL_MODELS + 2)
+  assert.equal(modelSelect(remoteTree).props.value, 'deepseek/deepseek-chat')
+})
+
+const routeFirst = await settle({
+  session: { modelCatalog: async () => ({ ok: true, value: { default: null, groups: [], failures: [] } }) },
+})
+const routeFirstTree = render(routeFirst)
+
+check('3c. the route wins over the Remote, so the panel and the picker agree', () => {
+  assert.equal(elementsOf(routeFirstTree, 'select').length, 1, 'an empty Remote must not win once the route answers')
+  assert.equal(modelSelect(routeFirstTree).props.value, 'deepseek/deepseek-chat', 'the served default pre-selects')
+})
+
 /* ------------------------- 4. 「自定义…」 keeps every route reachable */
 
-const custom = await settle({ session: { modelCatalog: async () => ({ ok: true, value: CATALOG }) } })
+const custom = await settle()
 const customReadyTree = render(custom)
 modelSelect(customReadyTree).props.onChange({ target: { value: customOptionValue(customReadyTree) } })
 const customTree = render(custom)
@@ -394,7 +436,7 @@ check('4b. the typed route is what the Host receives, slash inside the model kep
 /* --------------------------------- 5. an empty catalogue is a known state */
 
 const empty = await settle({
-  session: { modelCatalog: async () => ({ ok: true, value: { default: null, routableProviders: [], groups: [], failures: [] } }) },
+  models: { body: { default: null, routableProviders: [], groups: [], failures: [] } },
 })
 const emptyTree = render(empty)
 
@@ -426,7 +468,8 @@ const report = [
   `catalogue: ${CATALOG.groups.length} groups / ${TOTAL_MODELS} models -> ${elementsOf(tree, 'option').length} options (models + placeholder + 自定义…)`,
   `options: ${CATALOG.groups.map(group => `[${group.name}] ${group.models.map(model => `${group.id}/${model.id}`).join(', ')}`).join(' | ')}`,
   `default: catalog.default (${CATALOG.default.provider}/${CATALOG.default.model}) pre-selected`,
-  `fallback: throwing modelCatalog -> input[type=text] + ${ZH['panel.modelFallback']}`,
+  `source: ${MODELS_PATH} first, remote.session.modelCatalog() as the fallback`,
+  `fallback: 503 route + no Remote -> input[type=text] + ${ZH['panel.modelFallback']}`,
   `custom: ${customOptionValue(tree)} row -> text box -> POST model`,
   'reviewModels: state kept ([]), field removed, key absent from the request body',
 ]

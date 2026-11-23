@@ -240,6 +240,205 @@ test('flattenPages keeps a paragraph that ended with a full stop separate', () =
   assert.equal(flat.joined, 0)
 })
 
+test('flattenPages sews a paragraph across a page-bottom footnote (footnotes 1)', () => {
+  // 《巴布尔回忆录》 p. 21 verbatim: the note is printed under the last line of the
+  // page, so the page break that tears 白色 falls between the line and the note.
+  const flat = flattenPages([
+    { page: 1, blocks: [
+      { type: 'p', text: '在乌马尔·沙黑·米儿咱的晚年，巴拉·库赫山发现带有白' },
+      { type: 'footnote', text: '① 舒勒《突厥斯坦》谓费尔干纳谷地长约160英里。' },
+    ] },
+    { page: 2, blocks: [{ type: 'p', text: '色和红色纹理的石头。' }] },
+  ])
+  assert.equal(flat.blocks.length, 2)
+  assert.equal(flat.blocks[0].type, 'p')
+  assert.equal(flat.blocks[0].text, '在乌马尔·沙黑·米儿咱的晚年，巴拉·库赫山发现带有白色和红色纹理的石头。')
+  assert.equal(flat.blocks[1].type, 'footnote')
+  assert.equal(flat.blocks[1].text, '① 舒勒《突厥斯坦》谓费尔干纳谷地长约160英里。')
+  assert.equal(flat.joined, 1)
+})
+
+test('flattenPages does not sew a finished sentence across a footnote', () => {
+  const flat = flattenPages([
+    { page: 1, blocks: [
+      { type: 'p', text: '故不复有定居的居民存在。' },
+      { type: 'footnote', text: '① 费尔干纳，面积约二万平方公里。' },
+    ] },
+    { page: 2, blocks: [{ type: 'p', text: '费尔干纳，地方不大。' }] },
+  ])
+  assert.equal(flat.blocks.length, 3)
+  assert.equal(flat.blocks[2].text, '费尔干纳，地方不大。')
+  assert.equal(flat.joined, 0)
+})
+
+test('flattenPages glues a note the page break tore in two (footnotes 2)', () => {
+  const flat = flattenPages([
+    { page: 1, blocks: [{ type: 'footnote', text: '① 舒勒《突厥斯坦》谓费尔干纳谷地长约160英里' }] },
+    { page: 2, blocks: [{ type: 'footnote', text: '，最宽处为65英里。', continues: true }] },
+  ])
+  assert.equal(flat.blocks.length, 1)
+  assert.equal(flat.blocks[0].text, '① 舒勒《突厥斯坦》谓费尔干纳谷地长约160英里，最宽处为65英里。')
+})
+
+test('renderChapterHtml collects the notes at the end of the chapter (footnotes 3)', () => {
+  const chapter = {
+    title: '回历八九九年的事件',
+    level: 1,
+    blocks: [
+      { type: 'p', text: '费尔干纳①，位于第五气候带②。' },
+      { type: 'footnote', text: '① 面积约二万平方公里。' },
+      { type: 'footnote', text: '② 中世纪学者认为，世界分为七个气候带。' },
+      { type: 'p', text: '另有一段正文。' },
+    ],
+  }
+  const html = renderChapterHtml(chapter)
+  // the body is whole: no note stands between the paragraphs
+  assert.ok(!html.includes('<aside'), 'no inline aside with the default placement')
+  assert.match(html, /费尔干纳<a class="noteref" id="fnref1" href="#fn1"[^>]*>①<\/a>，位于第五气候带<a class="noteref" id="fnref2" href="#fn2"[^>]*>②<\/a>。/)
+  // exactly one section, holding both notes in printed order, behind the prose
+  assert.equal(html.match(/<section class="endnotes"/g)?.length, 1)
+  assert.ok(html.indexOf('<section') > html.indexOf('另有一段正文。'), 'the section closes the chapter')
+  assert.match(html, /<h2 class="endnotes-title">注 释<\/h2>/)
+  assert.ok(html.indexOf('面积约二万平方公里。') < html.indexOf('中世纪学者认为'))
+  // the number a note opens with is the way back
+  assert.match(html, /<div class="endnote"[^>]*id="fn1"><p><a class="noteback" href="#fnref1"[^>]*>①<\/a> 面积约二万平方公里。<\/p><\/div>/)
+})
+
+test('renderChapterHtml links nothing when footnoteLinks is off (footnotes 4)', () => {
+  const chapter = {
+    title: 'T',
+    level: 1,
+    blocks: [
+      { type: 'p', text: '正文①。' },
+      { type: 'footnote', text: '① 注文。' },
+    ],
+  }
+  const html = renderChapterHtml(chapter, { footnoteLinks: false })
+  assert.ok(!html.includes('noteref'), 'no forward link')
+  assert.ok(!html.includes('noteback'), 'no back link')
+  assert.ok(html.includes('正文①。'), 'the marker stays as a plain character')
+  assert.ok(html.includes('<section class="endnotes"'), 'the notes are still collected')
+})
+
+test('renderChapterHtml leaves a note whose marker is missing in place (footnotes 5)', () => {
+  const chapter = {
+    title: 'T',
+    level: 1,
+    blocks: [
+      { type: 'p', text: '正文没有标记。' },
+      { type: 'footnote', text: '① 这一页的标记在转录时丢了。' },
+    ],
+  }
+  const html = renderChapterHtml(chapter)
+  assert.ok(!html.includes('noteref'), 'nothing in the text to link from')
+  assert.ok(!html.includes('noteback'), 'and nothing to link back to')
+  assert.ok(html.includes('① 这一页的标记在转录时丢了。'), 'the note itself survives')
+})
+
+test('renderChapterHtml pairs repeated markers by order, not by first match (footnotes 6)', () => {
+  // The numbering restarts on every printed page, so ① appears twice: the first
+  // note belongs to the first marker, the second note to the second.
+  const chapter = {
+    title: 'T',
+    level: 1,
+    blocks: [
+      { type: 'p', text: '第一页的正文①。' },
+      { type: 'footnote', text: '① 第一页的注。' },
+      { type: 'p', text: '第二页的正文①。' },
+      { type: 'footnote', text: '① 第二页的注。' },
+    ],
+  }
+  const html = renderChapterHtml(chapter)
+  assert.match(html, /第一页的正文<a class="noteref" id="fnref1" href="#fn1"/)
+  assert.match(html, /第二页的正文<a class="noteref" id="fnref2" href="#fn2"/)
+})
+
+test('flattenPages turns a heading that is the rest of a sentence into prose (headings 1)', () => {
+  // 《巴布尔回忆录》 page 60 verbatim: one sentence printed across a page break,
+  // whose second half the model set apart and reported as an `h3`.
+  const flat = flattenPages([
+    { page: 1, blocks: [{ type: 'p', text: '他们终于进行了角力，札尼·伯克把他摔倒了。他真是' }] },
+    { page: 2, blocks: [{ type: 'h3', text: '一个勇士！' }, { type: 'p', text: '札尼·伯克是一个巨人。' }] },
+  ])
+  assert.equal(flat.blocks.length, 2)
+  assert.equal(flat.blocks[0].type, 'p')
+  assert.equal(flat.blocks[0].text, '他们终于进行了角力，札尼·伯克把他摔倒了。他真是一个勇士！')
+  assert.equal(flat.proseHeadings, 1)
+  assert.equal(flat.demotedHeadings, 0)
+})
+
+test('flattenPages keeps a real numbered heading (headings 2)', () => {
+  // 《巴布尔回忆录》 prints `三、蒙兀儿人的事务` right after a line ending in a
+  // half-width `)`. A label opener is a heading whatever the block above ends with.
+  const flat = flattenPages([
+    { page: 1, blocks: [{ type: 'p', text: '他从十一岁以后从未在同一个地方两次封斋。(见本书，f.330)' }] },
+    { page: 2, blocks: [{ type: 'h3', text: '三、蒙兀儿人的事务' }, { type: 'p', text: '正文。' }] },
+  ])
+  assert.equal(flat.blocks.length, 3)
+  assert.equal(flat.blocks[1].type, 'h3')
+  assert.equal(flat.blocks[1].text, '三、蒙兀儿人的事务')
+  assert.equal(flat.proseHeadings, 0)
+})
+
+test('flattenPages keeps a heading after a finished paragraph (headings 3)', () => {
+  // `图书在版编目(CIP)数据` follows a publisher line that carries no full stop.
+  // The block above it does not end a sentence, but the heading carries no
+  // sentence mark either, so it stays a heading.
+  const flat = flattenPages([
+    { page: 1, blocks: [{ type: 'p', text: '出版发行：商务印书馆 2009年·北京' }] },
+    { page: 2, blocks: [{ type: 'h2', text: '图书在版编目(CIP)数据' }, { type: 'p', text: '正文。' }] },
+  ])
+  assert.equal(flat.blocks[1].type, 'h2')
+  assert.equal(flat.proseHeadings, 0)
+
+  // And a title that happens to end with `！` is still a title when the paragraph
+  // above it is complete.
+  const finished = flattenPages([
+    { page: 1, blocks: [{ type: 'p', text: '上一段到这里就结束了。' }] },
+    { page: 2, blocks: [{ type: 'h2', text: '起来！' }, { type: 'p', text: '正文。' }] },
+  ])
+  assert.equal(finished.blocks[1].type, 'h2')
+  assert.equal(finished.proseHeadings, 0)
+})
+
+test('flattenPages keeps a heading that closes a bracket with a full stop inside (headings 4)', () => {
+  // `二、《传记之友》的记载（第三卷，第4编，第97页。）` is a printed heading whose
+  // last character is `）`; only the character itself is judged, never what it
+  // wraps, and the label opener guards it as well.
+  const flat = flattenPages([
+    { page: 1, blocks: [{ type: 'p', text: '如下几种材料可以说明。' }] },
+    { page: 2, blocks: [{ type: 'h2', text: '二、《传记之友》的记载（第三卷，第4编，第97页。）' }] },
+  ])
+  assert.equal(flat.blocks[1].type, 'h2')
+  assert.equal(flat.proseHeadings, 0)
+})
+
+test('a demoted heading cannot open a chapter (headings 5)', () => {
+  const chapters = buildChapters(flattenPages([
+    { page: 1, blocks: [
+      { type: 'h2', text: '第一章', page: 1 },
+      { type: 'p', text: '正文没写完的一句', page: 1 },
+    ] },
+    { page: 2, blocks: [{ type: 'h2', text: '又一个勇士！' }, { type: 'p', text: '后面的正文。' }] },
+  ]).blocks, { splitLevel: 2 })
+  assert.equal(chapters.length, 1)
+  assert.equal(chapters[0].blocks.length, 2)
+  assert.equal(chapters[0].blocks[0].text, '正文没写完的一句又一个勇士！')
+})
+
+test('renderChapterHtml with inline placement keeps the aside where it was printed (footnotes 7)', () => {  const chapter = {
+    title: 'T',
+    level: 1,
+    blocks: [
+      { type: 'p', text: '正文一句。' },
+      { type: 'footnote', text: '① 注文。' },
+    ],
+  }
+  const html = renderChapterHtml(chapter, { footnotePlacement: 'inline' })
+  assert.ok(html.includes('<aside class="footnote" epub:type="footnote"><p>① 注文。</p></aside>'))
+  assert.ok(!html.includes('<section class="endnotes"'))
+})
+
 test('buildChapters splits on the configured level and drops empty chapters', () => {
   const blocks = [
     { type: 'h2', text: '第一章', page: 1 },

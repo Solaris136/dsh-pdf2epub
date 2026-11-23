@@ -30,6 +30,24 @@ const ENUM_OPENER = /^[A-Z0-9一二三四五六七八九十]+[、.．)]/
 const FIGURE_IMAGE_RE = /^images\/[A-Za-z0-9][A-Za-z0-9._-]*\.png$/
 
 /**
+ * Marks a printed HEADING never ends with, because a heading is a label and not a
+ * sentence: `。！？…，、；`.
+ *
+ * `：` is deliberately absent - 「如下：」 is a real lead-in title - and so are the
+ * closing quotation and bracket shapes: 「二、《传记之友》的记载（第三卷，第4编，
+ * 第97页。）」 is a printed heading of 《巴布尔回忆录》 that really does end that
+ * way, and a sentence torn off the paragraph above never ends with a bracket.
+ */
+const HEADING_TAIL_STOPS = new Set(Array.from('。！？…，、；'))
+
+/**
+ * A label opener: `一、`, `（一）`, `1.`, `［…］`, `第一部`. A block that opens with
+ * one is a heading no matter how it ends, so the rule below can never eat a
+ * numbered section title.
+ */
+const LABEL_OPENER = /^(?:[（(【[［]?[一二三四五六七八九十百千〇零0-9]+[）)】\]］、.．]|[［[]|第[一二三四五六七八九十百千0-9]+[章节部编篇])/
+
+/**
  * Join two fragments with the separator the script requires.
  * @param {string} left - preceding text.
  * @param {string} right - following text.
@@ -116,6 +134,20 @@ export const JOINABLE_TYPES = new Set(['p', 'verse'])
 const SPLIT_FURNITURE = new Set(['page-number', 'footer', 'header'])
 
 /**
+ * Kinds of block a torn paragraph may be sewn back together across.
+ *
+ * {@link SPLIT_FURNITURE} is printed matter that leaves the book. A `footnote`
+ * is not: it is KEPT - the renderer moves it to the end of its chapter - but it
+ * is not part of the running text either. A page-bottom note sits under the last
+ * line of its page, so a paragraph the page break tore in half has the note
+ * BETWEEN its two halves, and treating the note as a paragraph boundary left the
+ * book reading `…山发现带有白` | ① | `色和红色纹理…` as two paragraphs (《巴布尔回忆录》).
+ * The note is therefore a gap a paragraph may be sewn across, exactly like a
+ * margin mark.
+ */
+const FLOW_GAP_TYPES = new Set([...SPLIT_FURNITURE, 'footnote'])
+
+/**
  * Decide whether a paragraph was cut in two by page furniture.
  *
  * The defect this exists for is not a page break: the model answered ONE page
@@ -125,10 +157,10 @@ const SPLIT_FURNITURE = new Set(['page-number', 'footer', 'header'])
  * if it had been cut. A join requires every one of:
  *
  *   1. both blocks are paragraphs - the only kind a split line can be;
- *   2. between them there is nothing but dropped furniture
- *      ({@link SPLIT_FURNITURE}); a heading, a table, a figure, a verse line, a
- *      footnote or any other kept block is a paragraph boundary, not a gap to
- *      close;
+ *   2. between them there is nothing but a gap a paragraph may be sewn across
+ *      ({@link FLOW_GAP_TYPES}: dropped furniture, or a footnote the renderer
+ *      moves to the end of the chapter); a heading, a table, a figure, a verse
+ *      line or any other kept block is a paragraph boundary, not a gap to close;
  *   3. the two blocks touch - the same page, or consecutive pages (a page
  *      selection can put two unrelated pages side by side, which is why the page
  *      numbers must prove the proximity - {@link pagesAreAdjacent});
@@ -152,11 +184,50 @@ function joinsAcrossFurniture(previous, block, pageNumber, gapTypes) {
   if (previous === undefined || previous === null) return false
   if (block.type !== 'p' || previous.type !== 'p') return false
   if (gapTypes.length === 0) return false
-  if (!gapTypes.every(type => SPLIT_FURNITURE.has(type))) return false
+  if (!gapTypes.every(type => FLOW_GAP_TYPES.has(type))) return false
   if (pageNumber !== previous.page && !pagesAreAdjacent(previous.page, pageNumber)) return false
   const left = String(previous.text ?? '').trimEnd()
   if (left === '') return false
   return !SENTENCE_END.has(left.charAt(left.length - 1))
+}
+
+/**
+ * Decide whether a block the model typed as a heading is really the rest of the
+ * paragraph before it.
+ *
+ * The defect this exists for is a heading that is visibly prose. Page 60 of
+ * 《巴布尔回忆录》 came back as
+ *
+ *     p  …他们终于进行了角力，札尼·伯克把他摔倒了。他真是
+ *     h3 一个勇士！
+ *
+ * - one sentence printed across a page break, whose second half the model set
+ * apart (a fresh page starts it) and reported as an `h3`. Nothing was wrong with
+ * the text, only with the type, and the book showed a paragraph ending mid-word
+ * with a bold line under it.
+ *
+ * A heading is a LABEL, so a block that ends with sentence punctuation
+ * ({@link HEADING_TAIL_STOPS}) cannot be one. Requiring a torn paragraph above as
+ * well is what keeps a real title safe: `2009年·北京` | `图书在版编目(CIP)数据`
+ * ends without any mark, and a title that happens to carry `！` is still a title
+ * when the block above it is complete. {@link LABEL_OPENER} is the third guard,
+ * so `二、关于阙简中的问题` can never be read as a sentence.
+ *
+ * @param {{ type: string, text: string }} block - the block typed as a heading.
+ * @param {{ type: string, text: string, page: number } | undefined} previous - last kept block of the running text.
+ * @returns {boolean} true when the block is prose and must join the paragraph above.
+ */
+function headingIsProse(block, previous) {
+  if (previous === undefined || previous === null) return false
+  if (previous.type !== 'p') return false
+  const left = String(previous.text ?? '').trimEnd()
+  if (left === '') return false
+  // A heading after a FINISHED paragraph is a heading, whatever it ends with.
+  if (SENTENCE_END.has(left.charAt(left.length - 1))) return false
+  const title = String(block.text ?? '').trim()
+  if (title === '') return false
+  if (LABEL_OPENER.test(title)) return false
+  return HEADING_TAIL_STOPS.has(title.charAt(title.length - 1))
 }
 
 /**
@@ -405,7 +476,7 @@ const CHAPTER_HEADING_LEVELS = new Set(['h1', 'h2'])
  * documented on {@link headingKey}.
  *
  * @param {{ page: number, blocks: {type: string, text: string, continues?: boolean, bbox?: number[], image?: string}[] }[]} pages - pages in order.
- * @returns {{ blocks: { type: string, text: string, page: number, continues?: boolean, bbox?: number[], image?: string }[], dropped: number, joined: number, rejectedJoins: number, demotedHeadings: number }} `demotedHeadings` counts chapter-level headings dropped by the two running-head criteria (same page as a same-text `header`, or the open chapter's name while that name is printed as a `header` somewhere in the book).
+ * @returns {{ blocks: { type: string, text: string, page: number, continues?: boolean, bbox?: number[], image?: string }[], dropped: number, joined: number, rejectedJoins: number, demotedHeadings: number, proseHeadings: number }} `demotedHeadings` counts chapter-level headings dropped by the two running-head criteria (same page as a same-text `header`, or the open chapter's name while that name is printed as a `header` somewhere in the book); `proseHeadings` counts headings that were really the rest of the paragraph above and were sewn back into it (see {@link headingIsProse}).
  */
 export function flattenPages(pages) {
   const blocks = []
@@ -413,14 +484,21 @@ export function flattenPages(pages) {
   let joined = 0
   let rejectedJoins = 0
   let demotedHeadings = 0
-  // Kinds of the blocks dropped between the last kept block and the one being
-  // visited. It is what lets a paragraph split by a leaf mark be recognised:
-  // page 375 of the pilot book answered one page as `…要塞里出` / `215b` / `生。…`,
-  // and after the `page-number` block was dropped the two `p` blocks were the two
-  // halves of one sentence. {@link joinsAcrossFurniture} reads this list, so it
-  // must hold the kinds of NON-kept blocks only, and be emptied whenever a block
-  // is kept (pushed or appended to).
+  let proseHeadings = 0
+  // Kinds of the blocks between the last kept block of the RUNNING TEXT and the
+  // one being visited. It is what lets a paragraph split by a leaf mark be
+  // recognised: page 375 of the pilot book answered one page as `…要塞里出` / `215b`
+  // / `生。…`, and after the `page-number` block was dropped the two `p` blocks
+  // were the two halves of one sentence. {@link joinsAcrossFurniture} reads this
+  // list, so it holds the kinds of the non-prose blocks only - dropped furniture,
+  // and a kept `footnote`, which the renderer moves out of the flow - and is
+  // emptied whenever a prose block is kept (pushed or appended to).
   const gapTypes = []
+  // Index in `blocks` of the last kept block that carries running text. A
+  // footnote is kept but is not running text, so it never becomes `proseIndex`:
+  // a paragraph the note was printed under is sewn back together across it, and
+  // the note then follows the whole paragraph instead of interrupting it.
+  let proseIndex = -1
 
   /* ------------ the running heads of the book, and the chapter open at each level ------------ */
   // DELIBERATE: the keys are built from each block's own `text`, i.e. the full
@@ -478,6 +556,24 @@ export function flattenPages(pages) {
     previous.text = String(previous.text ?? '').trimEnd()
     append(previous, text, pageNumber)
   }
+  /**
+   * Keep a block that could not be joined to the block before it.
+   *
+   * Which one it is decides what the NEXT block may join across: a footnote is
+   * kept but leaves the running text, so it joins `gapTypes` and `proseIndex`
+   * stays where it was - that is what lets `…带有白` | ① | `色和红色纹理…` become
+   * one paragraph again. Every other kind is running text (or a figure standing
+   * in it): it becomes the new anchor and the gap is closed.
+   */
+  const keep = (entry) => {
+    blocks.push(entry)
+    if (entry.type === 'footnote') {
+      gapTypes.push('footnote')
+      return
+    }
+    proseIndex = blocks.length - 1
+    gapTypes.length = 0
+  }
   for (const page of pages) {
     // The folios of *this* page, collected once before the blocks are visited,
     // so the order the model put the page number in cannot matter.
@@ -494,6 +590,10 @@ export function flattenPages(pages) {
     }
     for (const block of page.blocks) {
       if (DROP_TYPES.has(block.type)) { dropped += 1; gapTypes.push(block.type); continue }
+      // The block as it will be KEPT: identical to `block` unless a heading turns
+      // out to be the rest of the paragraph above (`headingIsProse`), in which case
+      // it is prose from here on.
+      let kept = block
       // A chapter-level heading that repeats this page's `header` - or that repeats
       // the open chapter's name while that name is a running head somewhere in the
       // book - is furniture the model mistyped. It leaves the book exactly like the
@@ -521,34 +621,65 @@ export function flattenPages(pages) {
           gapTypes.push(block.type)
           continue
         }
+      }
+      // A heading that is really the rest of the paragraph above is prose - at ANY
+      // level, because the model sets a page's first line apart whether it reports
+      // it as an h2 or an h3. It must not open a chapter, and it is sewn back into
+      // the paragraph below.
+      const proseHeading = isHeading(block.type)
+        && headingIsProse(block, proseIndex >= 0 ? blocks[proseIndex] : undefined)
+      if (proseHeading) {
+        proseHeadings += 1
+        kept = { ...block, type: 'p' }
+      } else if (CHAPTER_HEADING_LEVELS.has(block.type)) {
         // A kept chapter-level heading opens a chapter: it becomes what the next
         // heading of its own level is compared against, and it closes the deeper
         // levels the chapter before it had opened.
+        const level = Number(block.type.slice(1))
         for (const deeper of [...openChapterKeys.keys()]) {
           if (deeper > level) openChapterKeys.delete(deeper)
         }
-        openChapterKeys.set(level, key)
+        openChapterKeys.set(level, headingKey(block.text))
       }
-      const raw = String(block.text ?? '')
-      const text = FOLIAGE_TYPES.has(block.type) ? stripFoliage(raw, folioTokens) : raw
-      if (text.trim() === '' && block.type !== 'figure') {
+      const raw = String(kept.text ?? '')
+      const text = FOLIAGE_TYPES.has(kept.type) ? stripFoliage(raw, folioTokens) : raw
+      if (text.trim() === '' && kept.type !== 'figure') {
         // Nothing to emit, but the block did stand between the paragraphs: an
         // empty `p` / `table` / heading is not furniture, so it keeps the two
         // sides apart instead of letting them join through it.
-        gapTypes.push(block.type)
+        gapTypes.push(kept.type)
         continue
       }
-      const previous = blocks[blocks.length - 1]
+      const previous = proseIndex >= 0 ? blocks[proseIndex] : undefined
+      // The heading that turned out to be prose: it is the rest of the paragraph
+      // above, so it joins it whatever the page numbers say - the two halves are
+      // already known to be one sentence.
+      if (kept !== block && previous !== undefined) {
+        sew(previous, text, page.page)
+        gapTypes.length = 0
+        continue
+      }
+      // A note the page break tore in two: the model flags the second half with
+      // `continues` (prompt rule 11), and only the previous note can be the rest
+      // of it. It is sewn onto that note rather than starting a note of its own,
+      // so the chapter-end list does not carry a headless fragment.
+      if (kept.type === 'footnote' && kept.continues === true) {
+        const last = blocks[blocks.length - 1]
+        if (last !== undefined && last.type === 'footnote' && pagesAreAdjacent(last.page, page.page)) {
+          append(last, text, page.page)
+          continue
+        }
+      }
       // A paragraph split by a leaf mark is usually flagged `continues: true` by
       // the model: the flag says "this block continues the paragraph before it",
       // and the model applies it to a same-page split too - which the flag branch
       // below cannot accept, because that branch exists for PAGE breaks. The
       // furniture rule answers both branches, so it is evaluated once and used
       // twice.
-      const rejoin = joinsAcrossFurniture(previous, block, page.page, gapTypes)
-      if (block.continues === true && previous !== undefined) {
+      const rejoin = joinsAcrossFurniture(previous, kept, page.page, gapTypes)
+      if (kept.continues === true && previous !== undefined) {
         if (pagesAreAdjacent(previous.page, page.page)
-          && JOINABLE_TYPES.has(previous.type) && previous.type === block.type) {
+          && JOINABLE_TYPES.has(previous.type) && previous.type === kept.type) {
           append(previous, text, page.page)
           gapTypes.length = 0
           continue
@@ -561,13 +692,12 @@ export function flattenPages(pages) {
         // Keep the marker on the block that starts here: the page break is still
         // real information for a human reviewing the conversion.
         rejectedJoins += 1
-        blocks.push(carryFigure({ type: block.type, text, page: page.page, continues: true }, block))
-        gapTypes.length = 0
+        keep(carryFigure({ type: kept.type, text, page: page.page, continues: true }, kept))
         continue
       }
       // The explicit flag is authoritative; the heuristic only covers replies
       // that never set it.
-      if (looksLikeContinuation(previous, { type: block.type, text, page: page.page })) {
+      if (looksLikeContinuation(previous, { type: kept.type, text, page: page.page })) {
         append(previous, text, page.page)
         gapTypes.length = 0
         continue
@@ -583,11 +713,10 @@ export function flattenPages(pages) {
         gapTypes.length = 0
         continue
       }
-      blocks.push(carryFigure({ type: block.type, text, page: page.page }, block))
-      gapTypes.length = 0
+      keep(carryFigure({ type: kept.type, text, page: page.page }, kept))
     }
   }
-  return { blocks, dropped, joined, rejectedJoins, demotedHeadings }
+  return { blocks, dropped, joined, rejectedJoins, demotedHeadings, proseHeadings }
 }
 
 /* ------------------------------------------------------------------ *
@@ -2350,6 +2479,156 @@ export function renderBlock(block, options = {}) {
 }
 
 /**
+ * The circled numbers a footnote is printed with, and the asterisk this book uses
+ * for a note about the manuscript it is transcribed from.
+ *
+ * The model is told to keep the marker at the head of a `footnote` block
+ * (`src/model/prompt.js`, rule 11), and the same character stands at the spot in
+ * the prose the note belongs to. That equality - not a position - is what pairs a
+ * note with its marker, because the marker of a page-bottom note is printed on an
+ * entirely different scale from the note text next to it.
+ */
+const NOTE_MARKERS = new Set(Array.from('①②③④⑤⑥⑦⑧⑨⑩⑪⑫⑬⑭⑮⑯⑰⑱⑲⑳'))
+
+/**
+ * Block kinds whose markers a chapter-end note can be linked from.
+ *
+ * All of them render their text as element content, so wrapping a marker in `<a>`
+ * cannot land inside an attribute. `figure` is deliberately absent: its text is
+ * the caption AND the `alt` attribute of the same `<img>`, and a marker inside
+ * `alt` must stay text.
+ */
+const MARKER_LINKABLE = new Set([
+  'p', 'quote', 'caption', 'verse', 'code', 'address', 'list', 'unknown', 'table',
+])
+
+/**
+ * The marker a note opens with, or `''` when it has none.
+ *
+ * @param {unknown} text - the note's own text.
+ * @returns {string} one character of {@link NOTE_MARKERS}, `'＊'`, or `''`.
+ */
+export function noteMarker(text) {
+  for (const char of String(text ?? '').trimStart()) {
+    if (NOTE_MARKERS.has(char)) return char
+    if (char === '＊' || char === '*') return '＊'
+    return ''
+  }
+  return ''
+}
+
+/**
+ * Pair every note of a chapter with the marker it annotates.
+ *
+ * The markers are collected from the RENDERED prose, in reading order, so the
+ * ordinal recorded here is the same ordinal {@link linkMarkers} counts while it
+ * walks that string - which keeps the pairing correct across the deterministic
+ * repairs (`balanceBrackets`, `normalizePunctuation`) a block goes through on its
+ * way to markup. A note is bound to the first unclaimed marker of its own
+ * character, because the numbering restarts on every printed page: `①` occurs a
+ * dozen times in one chapter, and only the order tells them apart. A note whose
+ * marker never appears in the text stays bound to nothing rather than pointing at
+ * whatever `①` happens to be first.
+ *
+ * @param {{ html: string, linkable?: boolean }[]} rendered - prose blocks, in order.
+ * @param {{ type: string, text: string }[]} notes - footnote blocks, in order.
+ * @returns {{ anchors: Map<number, Map<number, number>>, bound: boolean[] }} `anchors` maps a rendered-block index to `{ marker ordinal -> note number }`; `bound[i]` says whether note `i` found its marker.
+ */
+function planEndnotes(rendered, notes) {
+  const occurrences = []
+  rendered.forEach((entry, index) => {
+    if (entry.linkable !== true) return
+    let ordinal = 0
+    for (const char of entry.html) {
+      if (!NOTE_MARKERS.has(char)) continue
+      occurrences.push({ render: index, ordinal, char })
+      ordinal += 1
+    }
+  })
+  const anchors = new Map()
+  const bound = new Array(notes.length).fill(false)
+  let cursor = 0
+  for (let index = 0; index < notes.length; index += 1) {
+    const marker = noteMarker(notes[index].text)
+    if (marker === '' || marker === '＊') continue
+    let found = -1
+    for (let at = cursor; at < occurrences.length; at += 1) {
+      if (occurrences[at].char === marker) { found = at; break }
+    }
+    if (found === -1) continue
+    const hit = occurrences[found]
+    cursor = found + 1
+    bound[index] = true
+    if (!anchors.has(hit.render)) anchors.set(hit.render, new Map())
+    anchors.get(hit.render).set(hit.ordinal, index + 1)
+  }
+  return { anchors, bound }
+}
+
+/**
+ * Wrap the markers of one rendered block in note references.
+ *
+ * @param {string} html - markup of one prose block.
+ * @param {Map<number, number> | undefined} plan - `{ marker ordinal -> note number }` for this block.
+ * @returns {string} the same markup with `<a epub:type="noteref">` around the bound markers.
+ */
+function linkMarkers(html, plan) {
+  if (plan === undefined || plan.size === 0) return html
+  let out = ''
+  let ordinal = 0
+  for (const char of html) {
+    if (NOTE_MARKERS.has(char)) {
+      const number = plan.get(ordinal)
+      ordinal += 1
+      if (number !== undefined) {
+        out += `<a class="noteref" id="fnref${number}" href="#fn${number}" epub:type="noteref" role="doc-noteref">${char}</a>`
+        continue
+      }
+    }
+    out += char
+  }
+  return out
+}
+
+/**
+ * Render a chapter's notes as the endnotes section that closes it.
+ *
+ * One `<div epub:type="endnote">` per note, in the order the notes were printed,
+ * each with a stable `id` the marker in the text links to. The circled number a
+ * note opens with becomes the way back (`epub:type="backlink"`), so a reader that
+ * offers a "return to the reference" gesture has a target for it; a note whose
+ * marker is missing from the text keeps its number as plain text.
+ *
+ * @param {{ text: string }[]} notes - footnote blocks of this chapter.
+ * @param {{ bound: boolean[] }} plan - binding decided by {@link planEndnotes}.
+ * @param {{ language?: string, links?: boolean }} [options] - `language` picks the heading; `links: false` keeps every number as plain text.
+ * @returns {string} the `<section>` markup.
+ */
+function renderEndnotes(notes, plan, options = {}) {
+  const label = /^zh/i.test(String(options.language ?? 'zh-CN')) ? '注 释' : 'Notes'
+  const rows = notes.map((note, index) => {
+    const number = index + 1
+    const text = proseText('footnote', String(note.text ?? ''))
+    const marker = noteMarker(text)
+    const lead = text.length - text.trimStart().length
+    const bound = options.links !== false && plan.bound[index] === true
+      && marker !== '' && text.charAt(lead) === marker
+    const body = bound
+      ? `${escapeHtml(text.slice(0, lead))}`
+        + `<a class="noteback" href="#fnref${number}" epub:type="backlink" role="doc-backlink">${escapeHtml(marker)}</a>`
+        + `${escapeHtml(text.slice(lead + marker.length))}`
+      : escapeHtml(text)
+    return `  <div class="endnote" epub:type="endnote" role="doc-endnote" id="fn${number}"><p>${body}</p></div>`
+  })
+  return [
+    '<section class="endnotes" epub:type="endnotes" role="doc-endnotes">',
+    `  <h2 class="endnotes-title">${escapeHtml(label)}</h2>`,
+    ...rows,
+    '</section>',
+  ].join('\n')
+}
+
+/**
  * Render a chapter's body markup, prefixed with its own title heading.
  *
  * The title is emitted at exactly the level the chapter object carries, because
@@ -2366,8 +2645,23 @@ export function renderBlock(block, options = {}) {
  * match, never a string replacement, so the `《巴布尔回忆录》` in the prose is
  * untouched.
  *
+ * Footnotes are placed by `footnotePlacement`:
+ *
+ *   - `'chapter'` (the default): every note is lifted out of the running text and
+ *     collected in one endnotes section at the end of the chapter, with the
+ *     marker in the text turned into a reference and the note's own number
+ *     turned into the way back. A page-bottom note printed under the last line of
+ *     a page then cannot split a paragraph or interrupt a sentence, which is what
+ *     the pilot book needed: `…山发现带有白` | ① | `色和红色纹理…`.
+ *   - `'inline'`: the note stays where it was printed, as `<aside class="footnote"
+ *     epub:type="footnote">`, for a reader whose footnote popup wants the note in
+ *     the same document flow.
+ *
+ * `footnoteLinks: false` keeps the endnotes section but leaves the markers as
+ * plain characters, for a book whose reader styles every `<a>` in the body.
+ *
  * @param {{ title: string, level?: number, blocks: {type: string, text: string}[] }} chapter - chapter model.
- * @param {{ omitTitle?: boolean, offset?: number, chapterTitles?: string[] }} [options] - `omitTitle` for chapters already opened by an h1 block; `chapterTitles` for the contents correction.
+ * @param {{ omitTitle?: boolean, offset?: number, chapterTitles?: string[], footnotePlacement?: 'chapter' | 'inline', footnoteLinks?: boolean, language?: string }} [options] - `omitTitle` for chapters already opened by an h1 block; `chapterTitles` for the contents correction; `footnotePlacement` / `footnoteLinks` / `language` for the notes.
  * @returns {string} XHTML body fragment.
  */
 export function renderChapterHtml(chapter, options = {}) {
@@ -2377,6 +2671,13 @@ export function renderChapterHtml(chapter, options = {}) {
     parts.push(`<h${titleLevel}>${escapeHtml(chapter.title)}</h${titleLevel}>`)
   }
   const blocks = Array.isArray(chapter.blocks) ? chapter.blocks : []
+  // `inline` is the only placement that renders a note where it was printed;
+  // anything else - including an absent option, which is how a caller that never
+  // heard of footnotes calls this function - collects the notes at the end.
+  const collect = options.footnotePlacement !== 'inline'
+  const notes = []
+  /** @type {{ html: string, linkable: boolean }[]} */
+  const rendered = []
   for (let index = 0; index < blocks.length; index += 1) {
     const block = blocks[index]
     if (block.type === 'toc') {
@@ -2388,11 +2689,25 @@ export function renderChapterHtml(chapter, options = {}) {
       }
       index = cursor - 1
       const nav = renderTocEntries(entries, { chapterTitles: options.chapterTitles })
-      if (nav !== '') parts.push(nav)
+      if (nav !== '') rendered.push({ html: nav, linkable: false })
+      continue
+    }
+    if (collect && block.type === 'footnote') {
+      notes.push(block)
       continue
     }
     const html = renderBlock(block, { offset: options.offset ?? 0, chapterTitles: options.chapterTitles })
-    if (html !== '') parts.push(html)
+    if (html === '') continue
+    rendered.push({ html, linkable: MARKER_LINKABLE.has(block.type) })
   }
+  const plan = collect && notes.length > 0 ? planEndnotes(rendered, notes) : null
+  const links = options.footnoteLinks !== false
+  for (let index = 0; index < rendered.length; index += 1) {
+    const entry = rendered[index]
+    parts.push(plan !== null && links && entry.linkable
+      ? linkMarkers(entry.html, plan.anchors.get(index))
+      : entry.html)
+  }
+  if (plan !== null) parts.push(renderEndnotes(notes, plan, { language: options.language, links }))
   return parts.join('\n')
 }

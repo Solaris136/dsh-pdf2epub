@@ -42,10 +42,11 @@ import { readFile, stat } from 'node:fs/promises'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 
-/** The five exact route paths this plugin owns. */
+/** The six exact route paths this plugin owns. */
 export const ROUTE_PATHS = Object.freeze({
   run: '/dsh-pdf2epub/run',
   state: '/dsh-pdf2epub/state',
+  models: '/dsh-pdf2epub/models',
   book: '/dsh-pdf2epub/book',
   file: '/dsh-pdf2epub/file',
   epub: '/dsh-pdf2epub/epub',
@@ -184,7 +185,7 @@ const PIPELINE_URL = new URL('../pipeline.js', import.meta.url)
  * life of the process, so a release still has to be verified after restarting
  * the host.
  */
-const PIPELINE_API_VERSION = 1
+const PIPELINE_API_VERSION = 3
 
 /** Composed cache-bust stamp (`<mtime>-<PIPELINE_API_VERSION>`) the module below was loaded with; `undefined` until a load succeeds. */
 let pipelineVersion
@@ -326,6 +327,19 @@ export function parseSpec(input) {
   if (args.cover !== undefined) {
     if (typeof args.cover !== 'boolean') throw new Error('pdf2epub: "cover" must be a boolean')
     spec.cover = args.cover
+  }
+  /* Footnote layout: the two values are the whole vocabulary, so a typo is
+   * refused here instead of silently falling back to the default. */
+  if (args.footnotePlacement !== undefined) {
+    const value = requireString(args.footnotePlacement, 'footnotePlacement')
+    if (value !== 'chapter' && value !== 'inline') {
+      throw new Error('pdf2epub: "footnotePlacement" must be "chapter" or "inline"')
+    }
+    spec.footnotePlacement = value
+  }
+  if (args.footnoteLinks !== undefined) {
+    if (typeof args.footnoteLinks !== 'boolean') throw new Error('pdf2epub: "footnoteLinks" must be a boolean')
+    spec.footnoteLinks = args.footnoteLinks
   }
   if (args.force !== undefined) {
     if (typeof args.force !== 'boolean') throw new Error('pdf2epub: "force" must be a boolean')
@@ -760,13 +774,145 @@ export function recordArtifacts(jobId, canonical) {
 /* -------------------------------------------------------------------------- */
 
 /**
- * Register the five exact routes on the host webserver.
+ * One optional Host service, or `null` when this Host does not expose it.
+ *
+ * `ctx.get()` is the reflective read: these two services are not in `inject`,
+ * because a conversion that carries an explicit `model` needs neither, and a
+ * missing service must not roll the plugin back.
+ *
+ * @param {object} ctx - plugin context.
+ * @param {string} name - service name.
+ * @returns {object | null} the service, or `null`.
+ */
+function optionalService(ctx, name) {
+  try {
+    const service = ctx.get(name)
+    return service === undefined || service === null ? null : service
+  } catch {
+    return null
+  }
+}
+
+/**
+ * The first non-empty string among the candidates.
+ *
+ * The registry types are structural, and a Host may publish a provider as `id`,
+ * `provider` or `name`; reading all three keeps one release's naming drift from
+ * emptying the dropdown.
+ *
+ * @param {...unknown} candidates - values to test in order.
+ * @returns {string} the first non-empty string, or `''`.
+ */
+function firstString(...candidates) {
+  for (const candidate of candidates) {
+    if (typeof candidate === 'string' && candidate.trim() !== '') return candidate.trim()
+  }
+  return ''
+}
+
+/**
+ * Build catalogue groups from the `llm` registry.
+ *
+ * The second choice after `sessionController.modelCatalog()`, and the same
+ * providers one level down: `listProviders()` plus `listModels()` is what this
+ * profile can route *now*. A provider that refuses to list its models is skipped
+ * instead of failing the whole catalogue.
+ *
+ * @param {object} llm - the `llm` service.
+ * @returns {Promise<object[]>} catalogue groups.
+ */
+async function catalogFromProviders(llm) {
+  const providers = await llm.listProviders()
+  const groups = []
+  for (const info of Array.isArray(providers) ? providers : []) {
+    if (info === null || typeof info !== 'object') continue
+    const id = firstString(info.id, info.provider, info.name)
+    if (id === '') continue
+    let listed = []
+    try {
+      listed = typeof llm.listModels === 'function' ? await llm.listModels(id) : []
+    } catch {
+      listed = []
+    }
+    const models = []
+    for (const model of Array.isArray(listed) ? listed : []) {
+      if (model === null || typeof model !== 'object') continue
+      const modelId = firstString(model.id, model.model, model.name)
+      if (modelId === '') continue
+      const entry = { id: modelId }
+      const name = firstString(model.name, model.displayName)
+      if (name !== '' && name !== modelId) entry.name = name
+      const description = firstString(model.description)
+      if (description !== '') entry.description = description
+      models.push(entry)
+    }
+    if (models.length === 0) continue
+    groups.push({ id, name: firstString(info.name, info.displayName, id), models })
+  }
+  return groups
+}
+
+/**
+ * The profile's model catalogue, in the wire shape the panel already parses.
+ *
+ * `sessionController.modelCatalog()` is the built-in model picker's own source
+ * (`dsh-api-session-controller`): `{ default, groups, failures }`, where
+ * `groups[].id` is the provider id — exactly what `client.js`'s
+ * `readModelCatalog` reads — so a catalogue with groups is passed through
+ * untouched. An empty or failing answer falls through to the `llm` registry,
+ * which carries the same providers one level down.
+ *
+ * The panel cannot reach the generated `ctx.remote.session` namespace from a
+ * hand-written bundle, which is why the Host serves the catalogue here instead.
+ *
+ * @param {object} ctx - plugin context.
+ * @returns {Promise<object>} wire `ModelCatalog`.
+ * @throws {Error} when no source can name a single model, carrying every reason.
+ */
+async function readModelCatalog(ctx) {
+  const notes = []
+
+  const controller = optionalService(ctx, 'sessionController')
+  if (controller !== null && typeof controller.modelCatalog === 'function') {
+    try {
+      const catalog = await controller.modelCatalog()
+      if (catalog !== null && typeof catalog === 'object' && Array.isArray(catalog.groups) && catalog.groups.length > 0) {
+        return catalog
+      }
+      notes.push('sessionController.modelCatalog() listed no group')
+    } catch (error) {
+      notes.push(`sessionController.modelCatalog() failed: ${errorMessage(error)}`)
+    }
+  } else {
+    notes.push('this Host exposes no sessionController.modelCatalog()')
+  }
+
+  const llm = optionalService(ctx, 'llm')
+  if (llm !== null && typeof llm.listProviders === 'function') {
+    try {
+      const groups = await catalogFromProviders(llm)
+      if (groups.length > 0) return { default: null, groups, failures: [] }
+      notes.push('llm.listProviders() listed no model')
+    } catch (error) {
+      notes.push(`llm.listProviders() failed: ${errorMessage(error)}`)
+    }
+  } else {
+    notes.push('this Host exposes no llm.listProviders()')
+  }
+
+  throw new Error(notes.join('; '))
+}/**
+ * Register the six exact routes on the host webserver.
  *
  * Every route answers through one of two response styles, picked by the
- * webserver's own dispatch rule: the four readers are resources returning a
+ * webserver's own dispatch rule: the five readers are resources returning a
  * Fetch `Response`, the starter is a Node handler writing to `res` (a POST never
  * reaches a resource). Both fences check `requestRejection` first, because the
  * webserver itself authenticates nothing.
+ *
+ * `GET /models` answers the panel's 「模型」 dropdown with the profile's model
+ * catalogue (see {@link readModelCatalog}); it is the one reader that carries no
+ * job or path, because its caller is the panel's own mount.
  *
  * The two produced-file readers add two gates after the fence: the path must be
  * in {@link producedArtifacts} (otherwise 404, which reveals nothing), and it
@@ -796,6 +942,22 @@ export function registerRoutes(ctx, config) {
       return jsonResponse(200, state)
     },
   }), `pdf2epub: GET ${ROUTE_PATHS.state}`)
+
+  ctx.effect(() => ctx.webServer.register({
+    kind: 'exact',
+    path: ROUTE_PATHS.models,
+    resource: async (request) => {
+      const rejection = ctx.connection.requestRejection(request)
+      if (rejection !== undefined) return new Response('forbidden', { status: 403 })
+      try {
+        return jsonResponse(200, await readModelCatalog(ctx))
+      } catch (error) {
+        // A catalogue is optional: the panel keeps the free-text control and
+        // says why, so a Host without either service degrades instead of failing.
+        return jsonResponse(503, { error: errorMessage(error) })
+      }
+    },
+  }), `pdf2epub: GET ${ROUTE_PATHS.models}`)
 
   ctx.effect(() => ctx.webServer.register({
     kind: 'exact',

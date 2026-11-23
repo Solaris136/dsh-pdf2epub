@@ -26,6 +26,7 @@ const OUT = path.join(ROOT, '.out')
 const TRUSTED_HOST = '127.0.0.1:53061'
 const RUN = '/dsh-pdf2epub/run'
 const STATE = '/dsh-pdf2epub/state'
+const MODELS = '/dsh-pdf2epub/models'
 const BOOK = '/dsh-pdf2epub/book'
 const FILE = '/dsh-pdf2epub/file'
 const EPUB = '/dsh-pdf2epub/epub'
@@ -211,6 +212,8 @@ const CONFIG = {
   concurrency: 4,
   splitLevel: 2,
   language: 'zh-CN',
+  footnotePlacement: 'chapter',
+  footnoteLinks: true,
 }
 
 plugin.apply(ctx, CONFIG)
@@ -230,7 +233,7 @@ assert.equal(tool.name, 'pdf2epub')
 ok('1  tools.register called once, tool name is pdf2epub')
 
 const paramKeys = Object.keys(tool.parameters.properties)
-assert.deepEqual(paramKeys, ['input', 'outputDir', 'model', 'reviewModels', 'dpi', 'maxTokens', 'concurrency', 'splitLevel', 'pages', 'excludePages', 'cover', 'title', 'author', 'publisher', 'force'])
+assert.deepEqual(paramKeys, ['input', 'outputDir', 'model', 'reviewModels', 'dpi', 'maxTokens', 'concurrency', 'splitLevel', 'footnotePlacement', 'footnoteLinks', 'pages', 'excludePages', 'cover', 'title', 'author', 'publisher', 'force'])
 assert.deepEqual(tool.parameters.required, ['input'])
 ok('1b tool parameters match the contract', paramKeys.join(', '))
 
@@ -268,7 +271,7 @@ await assert.rejects(
 ok('1f tool execute reaches the pipeline and surfaces its error')
 
 /* 2. route table ---------------------------------------------------------- */
-assert.equal(recorded.routes.length, 5, 'webServer.register must be called five times')
+assert.equal(recorded.routes.length, 6, 'webServer.register must be called six times')
 const sortByPath = (left, right) => left.path.localeCompare(right.path)
 assert.deepEqual(
   recorded.routes.map(route => ({ kind: route.kind, path: route.path })).sort(sortByPath),
@@ -276,18 +279,19 @@ assert.deepEqual(
     { kind: 'exact', path: BOOK },
     { kind: 'exact', path: EPUB },
     { kind: 'exact', path: FILE },
+    { kind: 'exact', path: MODELS },
     { kind: 'exact', path: RUN },
     { kind: 'exact', path: STATE },
   ],
 )
-ok('2  webServer.register called 5x with exact paths', recorded.routes.map(route => route.path).join(' '))
+ok('2  webServer.register called 6x with exact paths', recorded.routes.map(route => route.path).join(' '))
 for (const route of recorded.routes) {
   const styles = [typeof route.resource, typeof route.handler].filter(type => type === 'function')
   assert.equal(styles.length, 1, `${route.path} must declare exactly one response style`)
   if (route.path === RUN) assert.equal(typeof route.handler, 'function', 'POST /run must be a Node handler')
   else assert.equal(typeof route.resource, 'function', `${route.path} must be a resource`)
 }
-ok('2b /run is a handler (POST), the four readers are resources')
+ok('2b /run is a handler (POST), the five readers are resources')
 
 /* The plugin must load without the `jobs` service (index.js used to inject it,
  * and a composition without it then refused to load the plugin at all). */
@@ -324,6 +328,23 @@ ok('5  GET /state unknown jobId -> 404 JSON', unknownJob.body)
 const missingJobId = await invoke(routeOf(STATE), trusted(STATE))
 assert.equal(missingJobId.status, 400)
 ok('6  GET /state without jobId -> 400')
+
+/* The catalogue reader never throws at the caller: it answers the profile's
+ * groups, or an explained 503 that the panel turns into the text field. */
+const modelsAnswer = await invoke(routeOf(MODELS), trusted(MODELS))
+const modelsBody = JSON.parse(modelsAnswer.body)
+assert.ok(
+  modelsAnswer.status === 200 || modelsAnswer.status === 503,
+  `GET /models answered ${modelsAnswer.status}`,
+)
+assert.ok(
+  Array.isArray(modelsBody.groups) || typeof modelsBody.error === 'string',
+  'GET /models must answer a catalogue or an error',
+)
+ok(
+  '6b GET /models answers a catalogue or an explained 503',
+  `status ${modelsAnswer.status}${Array.isArray(modelsBody.groups) ? ` groups ${modelsBody.groups.length}` : ` — ${modelsBody.error}`}`,
+)
 
 const bookFixture = path.join(OUT, 'fixture.book.json')
 const reportFixture = path.join(OUT, 'fixture.report.json')
@@ -776,7 +797,7 @@ try {
 /* Config keys the host will validate (from the schema in index.js). */
 console.log('')
 console.log('=== Config keys ===')
-console.log('primaryModel (required before converting, not required to load)  reviewModels  dpi  maxTokens  concurrency  splitLevel  language  outputDir')
+console.log('primaryModel (required before converting, not required to load)  reviewModels  dpi  maxTokens  concurrency  splitLevel  language  footnotePlacement  footnoteLinks  outputDir')
 console.log(`=== plugin module config keys in use ===`)
 console.log(Object.keys(CONFIG).join('  '))
 console.log('')

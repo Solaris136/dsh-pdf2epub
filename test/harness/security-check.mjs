@@ -27,7 +27,11 @@ import { fileURLToPath, pathToFileURL } from 'node:url'
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..')
 const WORK = path.join(ROOT, '.out', 'preview-fixer')
-const SOURCE = fs.readFileSync(path.join(ROOT, 'client.js'), 'utf8')
+// The region slicers below match banner text that spans a newline, so the
+// checkout's line endings must not decide whether this suite runs: a Windows
+// runner with `core.autocrlf=true` hands us CRLF, and the markers are written
+// with LF. Normalise once, here.
+const SOURCE = fs.readFileSync(path.join(ROOT, 'client.js'), 'utf8').replaceAll('\r\n', '\n')
 
 const START = '/* ------------------------------------------------------- EPUB CSS scoping */'
 const END = '/* ----------------------------------------------------- EPUB payload helpers */'

@@ -114,4 +114,7 @@ e2e 需要的 `.out/test.pdf` 与 `.out/test-long.pdf`，所以单独跑 `test/e
 4. **`npm ci` 失败**：`package-lock.json` 与 `package.json` 不一致。本地改依赖后要提交锁文件。
 5. **只在一个 Node 版本失败**：对照 `engines.node` 判断是提高下限还是避免新 API；不要为了过 CI
    悄悄删断言。
-6. **重跑**：Actions 页面 → 该次运行 → Re-run failed jobs；或推送新提交触发新一轮。
+6. **换行符**：仓库用 `.gitattributes` 把检出固定成 LF；测试脚本读取源码时也做了 CRLF 归一化。Windows runner
+   默认 `core.autocrlf=true`，曾让 `security-check` 的区域切片找不到跨行标记——只在 Windows 上挂、且报
+   「section banners / normalizeBook not found」时先查这条。
+7. **重跑**：Actions 页面 → 该次运行 → Re-run failed jobs；或推送新提交触发新一轮。

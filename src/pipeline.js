@@ -81,21 +81,21 @@
  * every reloaded revision stays in the ESM cache for the life of the process,
  * so a release still has to be verified after restarting the host.
  */
-const LOCAL_MODULE_VERSION = 11
+const LOCAL_MODULE_VERSION = 13
 
 import { createHash } from 'node:crypto'
 import { cp, mkdir, readFile, rename, rm, rmdir, stat, unlink, writeFile } from 'node:fs/promises'
 import path from 'node:path'
 
 /* Every `?v=` below must equal LOCAL_MODULE_VERSION, defined above. */
-import { buildEpub } from './epub/build.js?v=11'
-import { openPdf } from './pdf/index.js?v=11'
-import { DROP_TYPES, parsePageJson, plainBlock, countableCharacters } from './model/blocks.js?v=11'
-import { transcriptionPrompt, retryNote } from './model/prompt.js?v=11'
-import { checkPage, needsCrossReview, resolvePageRecord } from './model/gate.js?v=11'
-import { buildChapters, flattenPages, renderChapterHtml, stripIllegalXml } from './model/assemble.js?v=11'
-import { addUsage, emptyLedger, estimateTokens, mergeLedger, normalizeUsage } from './model/usage.js?v=11'
-import { REASONING_HEADROOM, callModel, imageBlock, parseRoute, resolveRoute } from './host/bridge.js?v=11'
+import { buildEpub } from './epub/build.js?v=13'
+import { openPdf } from './pdf/index.js?v=13'
+import { DROP_TYPES, parsePageJson, plainBlock, countableCharacters } from './model/blocks.js?v=13'
+import { transcriptionPrompt, retryNote } from './model/prompt.js?v=13'
+import { checkPage, needsCrossReview, resolvePageRecord } from './model/gate.js?v=13'
+import { buildChapters, flattenPages, renderChapterHtml, stripIllegalXml } from './model/assemble.js?v=13'
+import { addUsage, emptyLedger, estimateTokens, mergeLedger, normalizeUsage } from './model/usage.js?v=13'
+import { REASONING_HEADROOM, callModel, imageBlock, parseRoute, resolveRoute } from './host/bridge.js?v=13'
 
 /**
  * Bumped whenever the prompt or the block schema changes, to invalidate caches.
@@ -328,6 +328,14 @@ export async function runConversion(options) {
     const maxTokens = clamp(spec.maxTokens ?? config.maxTokens ?? 4000, 512, 16000)
     const concurrency = clamp(spec.concurrency ?? config.concurrency ?? 4, 1, 16)
     const splitLevel = clamp(spec.splitLevel ?? config.splitLevel ?? 2, 1, 6)
+    // Where a page-bottom footnote lands. `chapter` is the default: a note is
+    // printed under the last line of a printed page, so reflowing the page with
+    // the note still in place leaves it in the middle of a sentence the next page
+    // continues. `inline` stays available for a reader whose popup wants the note
+    // in the flow. Only `inline` is special-cased, so a value the plugin
+    // configuration did not clamp (a stale profile, say) still produces a book.
+    const footnotePlacement = spec.footnotePlacement ?? config.footnotePlacement
+    const footnoteLinks = spec.footnoteLinks ?? config.footnoteLinks
     const force = spec.force === true
     // Which pages this run converts, resolved before a single page is rendered or
     // sent: bad syntax is a caller error, and it must not cost a model call. The
@@ -591,7 +599,12 @@ export async function runConversion(options) {
       id: chapter.id,
       title: chapter.title,
       level: chapter.level,
-      html: renderChapterHtml(chapter, { chapterTitles }),
+      html: renderChapterHtml(chapter, {
+        chapterTitles,
+        footnotePlacement: footnotePlacement === 'inline' ? 'inline' : 'chapter',
+        footnoteLinks: footnoteLinks !== false,
+        language,
+      }),
     }))
 
     // Pool pages finish in whatever order the model answers, so the assets would
@@ -1213,6 +1226,12 @@ function buildReport(args) {
       // so a QC pass can see the defect was recognised instead of silently losing
       // structure.
       demotedHeadings: flattened.demotedHeadings,
+      // Headings that were really the rest of the paragraph above - one sentence
+      // printed across a page break, whose second half the model set apart and
+      // reported as an `h2`/`h3` (`…他真是` | `一个勇士！`). They were sewn back
+      // into that paragraph, so the book has neither a broken sentence nor a bold
+      // fragment standing in it. Not part of `blocksDropped`: the text is kept.
+      headingsAsProse: flattened.proseHeadings,
       blocksJoined: flattened.joined,
       blocksRejectedJoins: flattened.rejectedJoins,
       chapters: chapters.length,

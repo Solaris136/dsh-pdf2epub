@@ -34,6 +34,8 @@ const CONFIG_DEFAULTS = Object.freeze({
   concurrency: 4,
   splitLevel: 2,
   language: 'zh-CN',
+  footnotePlacement: 'chapter',
+  footnoteLinks: true,
 })
 
 /** Field ranges, restated here for the fallback path below. */
@@ -43,6 +45,19 @@ const CONFIG_RANGES = Object.freeze({
   concurrency: [1, 16],
   splitLevel: [1, 6],
 })
+
+/**
+ * Where a page-bottom footnote goes in the finished book.
+ *
+ * `chapter` is the default because it is what a reflowable page needs: the note
+ * is printed under the last line of a printed page, so leaving it in the flow
+ * puts it in the middle of a sentence the next page continues. `inline` keeps the
+ * note where it was printed, for a reader whose footnote popup wants it in the
+ * flow.
+ *
+ * @type {string[]}
+ */
+const FOOTNOTE_PLACEMENTS = Object.freeze(['chapter', 'inline'])
 
 /**
  * Resolve the host's schemastery.
@@ -72,6 +87,25 @@ async function loadSchemastery() {
 const z = await loadSchemastery()
 
 /**
+ * The schema of one enumerated setting.
+ *
+ * A union of constants renders as a real choice in the settings page; the
+ * fallback (`z` unavailable, or a schemastery release without `const`/`union`)
+ * is a plain string, and {@link normalizeConfig} clamps the value to the same
+ * list either way - a settings page that offers no menu must still not be able to
+ * put a typo into the book.
+ *
+ * @param {string[]} values - allowed values, in display order.
+ * @returns {object} schema for one value.
+ */
+function enumSchema(values) {
+  if (typeof z.union === 'function' && typeof z.const === 'function') {
+    return z.union(values.map(value => z.const(value)))
+  }
+  return z.string()
+}
+
+/**
  * Plugin configuration.
  *
  * Keys and defaults mirror what `runConversion` actually reads: a per-call
@@ -94,6 +128,8 @@ export const Config = z === null ? undefined : z.object({
   concurrency: z.natural().min(1).max(16).default(4).description('Pages transcribed at once.'),
   splitLevel: z.natural().min(1).max(6).default(2).description('Heading level that starts a new chapter.'),
   language: z.string().default('zh-CN').description('Language tag written into the EPUB.'),
+  footnotePlacement: enumSchema(FOOTNOTE_PLACEMENTS).default('chapter').description('Where a page-bottom footnote goes: "chapter" collects every note in an endnotes section at the end of its chapter, so a note cannot split a paragraph the way it did on the printed page; "inline" leaves it where it was printed, as an aside in the flow.'),
+  footnoteLinks: z.boolean().default(true).description('With footnotePlacement "chapter": turn the marker in the text into a link to its note and the note\'s number into a link back, for readers that jump between the two. Off leaves both as plain characters.'),
   outputDir: z.string().description('Output directory; defaults to the PDF\'s own directory.'),
 })
 
@@ -142,6 +178,12 @@ function normalizeConfig(config) {
   merged.outputDir = typeof merged.outputDir === 'string' && merged.outputDir !== '' ? merged.outputDir : undefined
   merged.primaryModel = typeof merged.primaryModel === 'string' ? merged.primaryModel : ''
   merged.language = typeof merged.language === 'string' && merged.language !== '' ? merged.language : CONFIG_DEFAULTS.language
+  merged.footnotePlacement = FOOTNOTE_PLACEMENTS.includes(merged.footnotePlacement)
+    ? merged.footnotePlacement
+    : CONFIG_DEFAULTS.footnotePlacement
+  // Anything but an explicit `false` means on: a host that hands the key over as
+  // a string ("false") must not silently switch the links off.
+  merged.footnoteLinks = merged.footnoteLinks !== false
   return merged
 }
 
@@ -161,6 +203,7 @@ function definePdf2epubTool(ctx, settings) {
       'Returns canonical JSON with the three output paths, page and chapter counts, token usage and the number of degraded pages. Pages are cached on disk, so re-running after an interruption resumes instead of starting over; pass force to ignore the cache.',
       'A big book can be converted in batches with pages ("1-5,31-35,73") and excludePages: only the selected pages are rendered and sent to a model, and the per-page cache stays keyed by the whole book, so later batches and the final whole-book run reuse every page already transcribed. Never copy or rename the PDF to split it - that changes the cache identity and throws the whole cache away.',
       'cover renders page 1 as the EPUB cover image; title, author and publisher override the PDF metadata on the book itself (the caller\'s value wins over the PDF\'s, and the PDF\'s over the file name).',
+      'Page-bottom footnotes are collected in an endnotes section at the end of their chapter (footnotePlacement "chapter", the default) with each marker linked to its note and each note linked back, so a note cannot be left standing in the middle of the sentence the next page continues; footnotePlacement "inline" keeps them in the flow instead.',
       'The primary model must accept image input. A long book takes minutes and the call returns only when the EPUB is written; for big documents the panel starts the same conversion as a background job instead.',
     ].join(' '),
     parameters: {
@@ -200,6 +243,15 @@ function definePdf2epubTool(ctx, settings) {
         splitLevel: {
           type: 'number',
           description: 'Heading level that starts a new chapter, 1-6.',
+        },
+        footnotePlacement: {
+          type: 'string',
+          enum: ['chapter', 'inline'],
+          description: 'Where a page-bottom footnote goes, overriding the configured footnotePlacement. "chapter" (the default) collects every note in an endnotes section at the end of its chapter and links each marker to its note, so a note printed under the last line of a page can no longer split a paragraph in half; "inline" keeps the aside where the note was printed.',
+        },
+        footnoteLinks: {
+          type: 'boolean',
+          description: 'With footnotePlacement "chapter": link every marker in the text to its note and every note number back to the text. Off leaves both as plain characters. Overrides the configured footnoteLinks.',
         },
         pages: {
           type: 'string',
@@ -333,6 +385,19 @@ function extendSpec(spec, args) {
   if (args.cover !== undefined) {
     if (typeof args.cover !== 'boolean') throw new Error('pdf2epub: "cover" must be a boolean')
     extended.cover = args.cover
+  }
+  for (const key of ['footnoteLinks']) {
+    if (args[key] === undefined) continue
+    if (typeof args[key] !== 'boolean') throw new Error(`pdf2epub: "${key}" must be a boolean`)
+    extended[key] = args[key]
+  }
+  if (args.footnotePlacement !== undefined) {
+    const value = args.footnotePlacement
+    if (typeof value !== 'string') throw new Error('pdf2epub: "footnotePlacement" must be a string')
+    if (!FOOTNOTE_PLACEMENTS.includes(value)) {
+      throw new Error(`pdf2epub: "footnotePlacement" must be ${FOOTNOTE_PLACEMENTS.map(item => JSON.stringify(item)).join(' or ')}`)
+    }
+    extended.footnotePlacement = value
   }
   return extended
 }

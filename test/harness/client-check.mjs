@@ -471,7 +471,11 @@ check('12. hiding the reading area keeps the book and restores it without refetc
   walk(restored, element => { if (element.props.className === 'dsh-pdf2epub-reader') restoredArticles.push(element) })
   assert.equal(restoredArticles.length, 1)
   assert.equal(restoredArticles[0].props.dangerouslySetInnerHTML.__html, book.chapters[0].html)
-  assert.deepEqual([...first.fetched], [], `the restored panel must not refetch, but requested: ${first.fetched.join(', ')}`)
+  // The catalogue is the one read a remount repeats on purpose (this Host has no
+  // route for it here, so the failure is not cached); book and progress must not
+  // be requested again.
+  const refetched = first.fetched.map(entry => entry.url).filter(url => !url.startsWith('/dsh-pdf2epub/models'))
+  assert.deepEqual(refetched, [], `the restored panel must not refetch, but requested: ${refetched.join(', ')}`)
 })
 
 /* ------------------------------------------- 13/14. HTTP contract with Host */

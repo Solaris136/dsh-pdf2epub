@@ -81,21 +81,21 @@
  * every reloaded revision stays in the ESM cache for the life of the process,
  * so a release still has to be verified after restarting the host.
  */
-const LOCAL_MODULE_VERSION = 10
+const LOCAL_MODULE_VERSION = 11
 
 import { createHash } from 'node:crypto'
 import { cp, mkdir, readFile, rename, rm, rmdir, stat, unlink, writeFile } from 'node:fs/promises'
 import path from 'node:path'
 
 /* Every `?v=` below must equal LOCAL_MODULE_VERSION, defined above. */
-import { buildEpub } from './epub/build.js?v=10'
-import { openPdf } from './pdf/index.js?v=10'
-import { DROP_TYPES, parsePageJson, plainBlock, countableCharacters } from './model/blocks.js?v=10'
-import { transcriptionPrompt, retryNote } from './model/prompt.js?v=10'
-import { checkPage, needsCrossReview, resolvePageRecord } from './model/gate.js?v=10'
-import { buildChapters, flattenPages, renderChapterHtml, stripIllegalXml } from './model/assemble.js?v=10'
-import { addUsage, emptyLedger, estimateTokens, mergeLedger, normalizeUsage } from './model/usage.js?v=10'
-import { REASONING_HEADROOM, callModel, imageBlock, parseRoute, resolveRoute } from './host/bridge.js?v=10'
+import { buildEpub } from './epub/build.js?v=11'
+import { openPdf } from './pdf/index.js?v=11'
+import { DROP_TYPES, parsePageJson, plainBlock, countableCharacters } from './model/blocks.js?v=11'
+import { transcriptionPrompt, retryNote } from './model/prompt.js?v=11'
+import { checkPage, needsCrossReview, resolvePageRecord } from './model/gate.js?v=11'
+import { buildChapters, flattenPages, renderChapterHtml, stripIllegalXml } from './model/assemble.js?v=11'
+import { addUsage, emptyLedger, estimateTokens, mergeLedger, normalizeUsage } from './model/usage.js?v=11'
+import { REASONING_HEADROOM, callModel, imageBlock, parseRoute, resolveRoute } from './host/bridge.js?v=11'
 
 /**
  * Bumped whenever the prompt or the block schema changes, to invalidate caches.

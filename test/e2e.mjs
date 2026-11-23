@@ -160,6 +160,19 @@
  * (bc) is the outer bound: an entry that differs from the chapter title by four
  * characters or more is left as transcribed rather than half-repaired.
  *
+ * The last three pin the full-book audit's three defects. (bd) the running head
+ * 「索引与译名对照」 that the model answered as `h1` on page 704 of 《巴布尔回忆录》
+ * where the page reports NO `header` block at all - the same-page criterion cannot
+ * see it, so the demotion gained a second criterion (the heading repeats the title
+ * of the chapter open at its own level AND that title is printed as a `header`
+ * somewhere in the book), the duplicate chapter is folded back and `nav.xhtml`
+ * lists the title once. (be) is the regression that keeps the second criterion from
+ * eating real chapters: a year chapter title IS printed as a running head
+ * elsewhere, but it does not repeat the previous chapter's title, so both year
+ * chapters survive with `demotedHeadings` 0. (bf) the date guard now speaks about
+ * pure numbers only, so `回历九一七年 175b (公元 1511 年)` loses its leaf mark
+ * while `公元 1529 年 9 月 7 日` on the same page keeps every digit.
+ *
  *   node test/e2e.mjs
  *
  * Artifacts land in `.out/e2e/`; the process exits 1 when any scenario fails.
@@ -372,7 +385,10 @@ const LEAF_CAUSE =
   '（（见 f. 376b）、（f. 49a）、见本书编叶 179b。、参看本书 171a 注。都是真书正文）；' +
   '弱标记 前 / 后 只在紧贴 token 时才算引证，逗号只对强标记剥离（到达那里后，101a 里的 101a 是叶码，不是引证）；' +
   '档 H 同时去掉了「本页必须有 page-number 块」这条门，没有页码块的页面同样按形状判；' +
+  '日期护栏只挡纯数字（回历九一七年 175b 里的 175b 带字母，不是年/月/日，按叶码删——p309 的残留）；' +
   '删除复用 removeFolioToken 的空格吞噬逻辑（"战斗，35a 开向" -> "战斗，开向"，不留双空格）；' +
+  '已知取舍，不要为它放宽 CJK 护栏：叶码夹在拉丁词中间时两侧都是拉丁字符、CJK 上下文不成立，' +
+  '所以 p419 的「(hu- 233a jra)」会留在书里——这条护栏正是防误删引证的主要防线；' +
   '纯数字（1494、1525）永远不在形状内，不能删'
 
 /**
@@ -404,7 +420,8 @@ const POSITION_CAUSE =
   '回归提示：两条规则都要先问「token 站在页码的位置上吗」——页码在版面上独立出现在页边：' +
   '必须处于块的边缘或两侧都是空白（… 9 月 … 的后侧紧贴「月」→ 拒绝）；' +
   '紧邻的非空白字符不能是 , ， 、 ; ； （库特比,217b → 拒绝）；' +
-  '紧邻（跳过空格）年/月/日/时/分/秒/页/卷/章/节 的一律不删，两条规则都问（公元 1529 年 9 月 7 日 的 9；第 135 页 的 135）；' +
+  '日期/引用护栏只对纯数字 token 生效：紧邻（跳过空格）年/月/日/时/分/秒/页/卷/章/节 的**纯数字**一律不删' +
+  '（公元 1529 年 9 月 7 日 的 9；第 135 页 的 135），带字母后缀的 175b 不在这条保护里（它不是年/月/日/页/卷）；' +
   '索引条目里的定位符不删——索引行有三种形态：拉丁转写开头（Malik \'Ali qutbi 马利克·阿力·库特比,217b）、' +
   '两个以上后跟列表标点的定位符（,13b,14b,55a）、逗号收尾且整行无句末标点的短条目（丁 · 巴耳班,267b）；' +
   '真正的页边页码仍要删（块首 58、块尾 58、两侧空白 58）。' +
@@ -412,23 +429,32 @@ const POSITION_CAUSE =
   '索引区（p701–764）的删除条数是 0，正文叶码清除量不得明显下降（见 .out/page-guards/report.txt）'
 
 /**
- * A running head the model typed as `h1` must not become a chapter, but only its
- * OWN page may prove that. `flattenPages` collects the `header` keys of the page it
- * is walking and demotes a chapter-level (`h1`/`h2`) heading whose normalized text
- * matches one of them. The book-wide version of this rule is the defect: in
- * 《巴布尔回忆录》 the running head and the chapter title are the same text (the
- * chapter's first page does not print a running head), so comparing a heading
- * against headers of OTHER pages deleted the real chapter titles. Nor is a repeated
- * title furniture - 「人 名」 is the title of every chapter's index.
+ * A running head the model typed as `h1`/`h2` must not become a chapter. The rule
+ * has TWO criteria and a heading is demoted only when at least one holds:
+ *
+ *  1. SAME PAGE - the heading repeats a `header` block printed on its own page;
+ *  2. SAME NAME AS THE OPEN CHAPTER, AND THAT NAME IS A RUNNING HEAD SOMEWHERE -
+ *     the heading repeats the title of the chapter open at its own level AND that
+ *     text is printed as a `header` on some page of the book.
+ *
+ * Either criterion alone was measured wrong on 《巴布尔回忆录》. The book-wide half
+ * of (2) alone is the defect: the running head and the chapter title are the same
+ * text (the chapter's first page prints no running head), so a book-wide set
+ * deleted the real year-chapter titles. The name half alone would eat legitimate
+ * consecutive same-name chapters - 「人 名」 is the title of every chapter's index.
+ * ANDed they are exact, which is what scenario (bd)/(be) pin from both sides. Nor
+ * is a repeated title furniture on its own: 「人 名」 repeats by design.
  */
 const RUNNING_HEAD_CAUSE =
-  '回归提示：书眉降级必须逐页判断——flattenPages 先收集本页 header 的 headingKey，' +
-  '再只把本页同键的 h1/h2 降级丢弃（同时计入 blocksDropped 与 demotedHeadings）；' +
-  '绝不能用全书 header 集合判标题（那会误杀章首页的真章标题：《巴布尔回忆录》的章首页印的就是同一句文本），' +
-  '也不能对重复的 h1/h2 做全书去重（索引小节「人 名」每章都有）。' +
+  '回归提示：书眉降级要两条判据，h1/h2 满足任意一条即丢弃（同时计入 blocksDropped 与 demotedHeadings）：' +
+  '① 同页——本页有同键（headingKey）的 header 块；' +
+  '② 同名且全书印过——标题与「同层已开的章」标题同键，且该键出现在全书任意 header 块的文本集合里，两条同时成立。' +
+  '只用 ② 会误杀章首页的真章标题（《巴布尔回忆录》的章首页印的就是书眉那同一句文本：前 190 页 9 个年章标题只剩 1 个）；' +
+  '只用「与上一个章同名」会误杀合法的同名连续章（索引小节「人 名」每章都有）。' +
+  '绝不对 h1/h2 做全书按标题去重。' +
   '比较键必须由块自身完整 text 经 headingKey 归一（空白折叠并去空格、全角 ASCII 与中日韩标点折成半角），' +
   '不得改用 pipeline 截断到 40 字符的 furnitureHint。' +
-  '否则书眉被标成 h1 就会凭空建章，nav 里多出空章；反过来全书判据会把真章标题整批删掉'
+  '否则「书眉被标成 h1 而本页恰好没有 header 块」会切出一个重名章（p704），nav 里同名条目出现两次'
 
 /**
  * A visually blank page is not a failed page. The model answering zero blocks is
@@ -4355,6 +4381,10 @@ async function scenarioSplitParagraphRejoined() {
  * and `2 月 2 日` (both occurrences are the page number of their page). The flat
  * `stripFoliage` output is asserted as well, because the rendered XHTML rewrites
  * punctuation and the dates have to survive the rule itself, not a lucky render.
+ *
+ * The guard protects PURE NUMBERS only (see scenario (bf)): a token carrying a
+ * letter suffix is a leaf mark, not a year or a month, so `回历九一七年 175b` is
+ * deleted while everything asserted here keeps every digit.
  */
 async function scenarioDateNumbersKept() {
   // Page 15, verbatim, with the page-number block the model really emitted.
@@ -4702,6 +4732,203 @@ async function scenarioTocEntryTooManySubstitutions() {
 }
 
 /* ------------------------------------------------------------------ *
+ * running head without a `header` block on its own page
+ * ------------------------------------------------------------------ */
+
+/**
+ * (bd) 书眉伪章被并回前一章.
+ *
+ * The defect this pins, from the full 764-page audit: page 704 of 《巴布尔回忆录》
+ * is the top of a continuation page inside the index, and the model answered its
+ * running head 「索引与译名对照」 as `h1` - but that page prints NO `header` block
+ * at all (the block was simply not reported), so the same-page criterion of
+ * scenario (as) cannot see it. The book grew a second chapter of that name and the
+ * 「人 名」 index was cut in two (ch088 pages 701-703, ch089 pages 704-741), with
+ * the same title listed twice in `nav.xhtml`.
+ *
+ * The page-704 shape is demoted by the SECOND criterion: the heading repeats the
+ * title of the chapter that is open at its own level (page 1 opens it as `h1`) AND
+ * that title is printed as a `header` somewhere in the book (page 2). Here page 1
+ * is the chapter's first page, page 2 is a continuation page that reports the line
+ * as furniture, and page 3 is page 704: the same line as `h1`, no `header`.
+ *
+ * The assertions are the audit's: exactly one chapter carries that title, the
+ * demotion is counted, `nav.xhtml` mentions the title once, and page 3's body text
+ * still reaches the chapter (it was folded into the chapter before it, not lost).
+ */
+async function scenarioRunningHeadWithoutOwnHeaderDemoted() {
+  const file = await headerPagesPdf()
+  const outDir = path.join(E2E_DIR, 'running-head-sibling')
+  const HEAD = '索引与译名对照'
+  const host = createFakeHost({
+    blocksByPage: {
+      1: [{ type: 'h1', text: HEAD }, { type: 'p', text: '索引首页正文。' }],
+      2: [{ type: 'header', text: HEAD }, { type: 'p', text: '索引续页正文。' }],
+      // The defect: the running head again, as `h1`, and NO `header` block on this
+      // page - so nothing on the page itself proves it is furniture.
+      3: [{ type: 'h1', text: HEAD }, { type: 'p', text: '索引末页正文。' }],
+    },
+  })
+  const run = await pipeline.runConversion({
+    host,
+    spec: { input: file, outputDir: outDir },
+    config: { primaryModel: PRIMARY, reviewModels: [], dpi: 100, concurrency: 1 },
+  })
+  state.epubs.push(run.epubPath)
+
+  const book = JSON.parse(await readFile(run.bookJsonPath, 'utf8'))
+  const entries = unzip(await readFile(run.epubPath))
+  const body = allChapterText(entries)
+  const nav = strFromU8(entries['OEBPS/nav.xhtml'])
+  const titles = book.chapters.map(chapter => chapter.title)
+
+  expect('(bd) 伪章没有开出来（chapters === 1）', run.report.stats.chapters, 1,
+    { detail: show(titles), cause: RUNNING_HEAD_CAUSE })
+  expect('(bd) 只有 1 个以该书眉为标题的章', titles.filter(title => title === HEAD).length, 1,
+    { detail: show(titles), cause: RUNNING_HEAD_CAUSE })
+  expect('(bd) 伪章被计入 demotedHeadings（=== 1）', run.report.stats.demotedHeadings, 1,
+    { detail: `demotedHeadings = ${run.report.stats.demotedHeadings}`, cause: RUNNING_HEAD_CAUSE })
+  expect('(bd) nav 里该标题只出现 1 次', countOf(nav, HEAD), 1,
+    { detail: shorten(nav), cause: RUNNING_HEAD_CAUSE })
+  expectTrue('(bd) 页 C 的正文并入前一章（没有丢）',
+    String(book.chapters[0]?.html ?? '').includes('索引末页正文'),
+    { detail: shorten(book.chapters[0]?.html ?? ''), cause: RUNNING_HEAD_CAUSE })
+  expectTrue('(bd) 三页正文都还在书里',
+    ['索引首页正文', '索引续页正文', '索引末页正文'].every(text => body.includes(text)),
+    { detail: shorten(body), cause: RUNNING_HEAD_CAUSE })
+
+  note(`(bd) chapters=${run.report.stats.chapters} titles=${JSON.stringify(titles)} `
+    + `demotedHeadings=${run.report.stats.demotedHeadings} nav「${HEAD}」×${countOf(nav, HEAD)}`)
+
+  return `chapters ${run.report.stats.chapters} | nav ×${countOf(nav, HEAD)} | `
+    + `demoted ${run.report.stats.demotedHeadings} | 页 C 并入=${String(book.chapters[0]?.html ?? '').includes('索引末页正文')}`
+}
+
+/**
+ * (be) 年章标题不会被误降级.
+ *
+ * THE regression this rule must not break, and the reason criterion 2 needs its
+ * SECOND half as well. 《巴布尔回忆录》 prints 「回历九〇X年(公元 …)的事件」 as the
+ * running head of every continuation page and centers the same line as the chapter
+ * title on the chapter's first page, where no running head is printed. So a year
+ * chapter title IS a text that appears in the book-wide `header` set - the only
+ * thing that keeps it alive is that it does NOT repeat the title of the chapter
+ * before it (every year has its own title).
+ *
+ * Page 1 prints 「回历九〇〇年的事件」 as furniture only (a continuation page whose
+ * model reported nothing but the running head); page 2 opens 「回历八九九年的事件」;
+ * page 3 opens 「回历九〇〇年的事件」. Both chapters must survive, `demotedHeadings`
+ * must be exactly 0, and page 3's title must really open the second chapter.
+ */
+async function scenarioYearChapterTitlesKept() {
+  const file = await headerPagesPdf()
+  const outDir = path.join(E2E_DIR, 'year-chapters-vs-running-head')
+  const YEAR_899 = '回历八九九年的事件'
+  const YEAR_900 = '回历九〇〇年的事件'
+  const host = createFakeHost({
+    blocksByPage: {
+      // A continuation page: the year line as furniture, nothing else.
+      1: [{ type: 'header', text: YEAR_900 }],
+      2: [{ type: 'h1', text: YEAR_899 }, { type: 'p', text: '八九九年的正文。' }],
+      // The same text as page 1's running head, but it is a DIFFERENT chapter's
+      // title from the one page 2 opened - so it is a real chapter title.
+      3: [{ type: 'h1', text: YEAR_900 }, { type: 'p', text: '九〇〇年的正文。' }],
+    },
+  })
+  const run = await pipeline.runConversion({
+    host,
+    spec: { input: file, outputDir: outDir },
+    config: { primaryModel: PRIMARY, reviewModels: [], dpi: 100, concurrency: 1 },
+  })
+  state.epubs.push(run.epubPath)
+
+  const book = JSON.parse(await readFile(run.bookJsonPath, 'utf8'))
+  const entries = unzip(await readFile(run.epubPath))
+  const body = allChapterText(entries)
+  const nav = strFromU8(entries['OEBPS/nav.xhtml'])
+  const titles = book.chapters.map(chapter => chapter.title)
+
+  expect('(be) 两个年章都在', titles, [YEAR_899, YEAR_900],
+    { detail: show(titles), cause: RUNNING_HEAD_CAUSE })
+  expect('(be) chapters === 2', run.report.stats.chapters, 2,
+    { detail: show(titles), cause: RUNNING_HEAD_CAUSE })
+  expect('(be) demotedHeadings === 0（年章标题不被降级）', run.report.stats.demotedHeadings, 0,
+    { detail: `demotedHeadings = ${run.report.stats.demotedHeadings}`, cause: RUNNING_HEAD_CAUSE })
+  expectTrue('(be) nav 里两个年章都在',
+    nav.includes(YEAR_899) && nav.includes(YEAR_900),
+    { detail: shorten(nav), cause: RUNNING_HEAD_CAUSE })
+  expectTrue('(be) 两页正文各自在自己的章里',
+    String(book.chapters[0]?.html ?? '').includes('八九九年的正文')
+      && String(book.chapters[1]?.html ?? '').includes('九〇〇年的正文'),
+    { detail: shorten(String(book.chapters[1]?.html ?? '')), cause: RUNNING_HEAD_CAUSE })
+  expectTrue('(be) 三页内容都还在书里（第 1 页书眉是家具，不算正文）',
+    body.includes('八九九年的正文') && body.includes('九〇〇年的正文'),
+    { detail: shorten(body), cause: RUNNING_HEAD_CAUSE })
+
+  note(`(be) chapters=${run.report.stats.chapters} titles=${JSON.stringify(titles)} `
+    + `demotedHeadings=${run.report.stats.demotedHeadings} nav 两章都在=${nav.includes(YEAR_899) && nav.includes(YEAR_900)}`)
+
+  return `chapters ${run.report.stats.chapters} | titles ${JSON.stringify(titles)} | `
+    + `demoted ${run.report.stats.demotedHeadings}`
+}
+
+/**
+ * (bf) 纯数字日期仍受保护、带字母叶码被清除.
+ *
+ * The two faces of the date guard after the page-309 fix. `175b` stands right
+ * behind `年` in `当我在回历九一七年 175b (公元 1511 年)夺取撒马尔罕时`, and the
+ * guard that refuses to delete a number beside `年`/`月`/`日`/`页`/`卷`/`章`/`节`
+ * kept it in the finished book for the whole audit. A token with a letter suffix is
+ * not a year, a month or a page: the guard now only speaks about PURE numbers
+ * ({@link PURE_DIGITS} in `src/model/assemble.js`), so `175b` is judged by the leaf
+ * rule's remaining guards and deleted, while `9 月` on the very same page is still
+ * kept because the page's `page-number` block is `9` (scenario (av)'s shape).
+ *
+ * Both sentences share one page on purpose: the same page number is the `9` of the
+ * date AND the `175b` stands next to the `年` of another date, so a fix that simply
+ * dropped the guard would lose the month here.
+ */
+async function scenarioPureDateKeptLeafMarkRemoved() {
+  const page = await renderOneBlockPage('leaf-date-175b', [
+    { type: 'p', text: '回历九三六年穆哈兰月三日(公元 1529 年 9 月 7 日)原稿中断。' },
+    { type: 'p', text: '当我在回历九一七年 175b (公元 1511 年)夺取撒马尔罕时,赛伊德·哈三来到我处。' },
+    { type: 'page-number', text: '9' },
+  ])
+
+  expectTrue('(bf) 纯数字日期完整保留（公元 1529 年 9 月 7 日）',
+    page.includes('公元 1529 年 9 月 7 日'), { detail: shorten(page), cause: POSITION_CAUSE })
+  expectTrue('(bf) 没有留下「年月」这种缺月份数字的畸形串', !page.includes('年月'),
+    { detail: shorten(page), cause: POSITION_CAUSE })
+  expectTrue('(bf) 带字母的叶码 175b 被清除', !page.includes('175b'),
+    { detail: shorten(page), cause: LEAF_CAUSE })
+  // The deletion eats the spaces that only kept the margin mark apart, so the
+  // parenthetical closes onto the year: `回历九一七年(公元 1511 年)`. The space in
+  // the printed line is typography of the margin mark, not a word separator, and
+  // the exact shape is asserted flat below.
+  expectTrue('(bf) 句子接成「回历九一七年(公元 1511 年)夺取撒马尔罕时」',
+    /回历九一七年[ 　]?[(（]公元 1511 年[)）]夺取撒马尔罕时/.test(page),
+    { detail: shorten(page), cause: LEAF_CAUSE })
+  expectTrue('(bf) 句末没有留下双空格',
+    !/<p>[^<]*[ \t]{2,}[^<]*<\/p>/.test(page), { detail: shorten(page), cause: LEAF_CAUSE })
+
+  expect('(bf) stripFoliage 删掉 175b（规则自身的输出）',
+    stripFoliage('当我在回历九一七年 175b (公元 1511 年)夺取撒马尔罕时', ['277']),
+    '当我在回历九一七年(公元 1511 年)夺取撒马尔罕时', { cause: LEAF_CAUSE })
+  expect('(bf) stripFoliage 仍保留纯数字日期',
+    stripFoliage('回历九三六年穆哈兰月三日(公元 1529 年 9 月 7 日)原稿中断。', ['9']),
+    '回历九三六年穆哈兰月三日(公元 1529 年 9 月 7 日)原稿中断。', { cause: POSITION_CAUSE })
+  expect('(bf) stripFoliage 不把 175b 当页码（page-number 是 9）',
+    stripFoliage('175b 这是一段正文', ['9']), '这是一段正文', { cause: LEAF_CAUSE })
+
+  note(`(bf) 日期保留=${page.includes('公元 1529 年 9 月 7 日')} `
+    + `| 175b 残留=${page.includes('175b')} `
+    + `| 句子=${/回历九一七年[^夺]{0,20}/.exec(page)?.[0] ?? '(not found)'}`)
+
+  return `date kept=${page.includes('公元 1529 年 9 月 7 日')} | 175b removed=${!page.includes('175b')} | `
+    + `sentence=${/回历九一七年[^夺]{0,20}/.exec(page)?.[0] ?? '(not found)'}`
+}
+
+/* ------------------------------------------------------------------ *
  * runner
  * ------------------------------------------------------------------ */
 const SCENARIOS = [
@@ -4760,6 +4987,9 @@ const SCENARIOS = [
   ['(ba) 正文里的《回忆录》不被误伤', scenarioProseMemoryUntouched],
   ['(bb) 括号内的数字不被替换', scenarioTocDigitsInsideParenthesesKept],
   ['(bc) 替换次数超限时不动', scenarioTocEntryTooManySubstitutions],
+  ['(bd) 书眉伪章被并回前一章', scenarioRunningHeadWithoutOwnHeaderDemoted],
+  ['(be) 年章标题不会被误降级', scenarioYearChapterTitlesKept],
+  ['(bf) 纯数字日期仍受保护、带字母叶码被清除', scenarioPureDateKeptLeafMarkRemoved],
 ]
 
 async function main() {

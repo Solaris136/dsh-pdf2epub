@@ -325,40 +325,75 @@ const CHAPTER_HEADING_LEVELS = new Set(['h1', 'h2'])
  * navigation document, and broke the page's continuation because its first
  * paragraph now followed a "title" instead of the previous page.
  *
- * The defect is demoted PAGE BY PAGE, and the criterion is deliberately narrow: a
- * chapter-level (`h1`/`h2`) heading is dropped only when the SAME page also carries
- * a `header` block with the same {@link headingKey}. A heading on a page that
- * prints no running head at all is a real chapter title and is kept. Each page is
- * therefore scanned twice - once to collect the keys of its own `header` blocks,
- * once to walk its blocks - which is all the book-wide knowledge this rule needs.
+ * A chapter-level (`h1`/`h2`) heading is demoted by TWO criteria, and BOTH have to
+ * hold - each one on its own was measured wrong on a real book:
  *
- * Why not compare the heading against every `header` in the book (the previous,
- * book-wide form of this rule)? Because in a real book the running head and the
- * chapter title are THE SAME TEXT. 《巴布尔回忆录》 prints 「回历九〇X年(公元 …)的事件」
- * in the margin of every continuation page and centers the very same line as the
- * chapter title on the chapter's first page, where no running head is printed. A
- * book-wide set of header texts therefore matched every one of those titles and the
- * rule deleted them: of the 9 year-heading `h1`s in the first 190 cached pages only
- * 1 survived, and the book came out with 2 chapters where it should have had a
- * dozen. "Same page, same key" keeps the page-537 defect demoted and the chapter
- * title alive.
+ *  1. SAME PAGE - the heading's {@link headingKey} equals the key of a `header`
+ *     block printed on its OWN page. That is the page-537 shape: the model
+ *     reported one printed line twice on one page, once as furniture and once as
+ *     a title.
+ *  2. SAME NAME AS THE OPEN CHAPTER, AND THAT NAME IS A RUNNING HEAD SOMEWHERE -
+ *     the heading's key equals the title of the chapter that is currently open AT
+ *     ITS OWN LEVEL, AND the same key occurs in the `header` text of SOME page of
+ *     the book. That is the page-704 shape: the index section 「索引与译名对照」
+ *     opens at page 701 as `h1` (followed on the same page by the `h2` section
+ *     「人 名」), and page 704 repeats the very same line as its running head but
+ *     answers it as `h1` with no `header` block on that page at all, so criterion
+ *     1 cannot see it. The book then carried TWO chapters of that name and the
+ *     人名 index was cut in half (ch088 pages 701-703, ch089 pages 704-741).
+ *     "At its own level" is what makes this work: the heading on page 704 is a
+ *     SIBLING of the `h1` on page 701, so the chapter it repeats is that one, not
+ *     the `h2` 「人 名」 chapter that happens to be the most recently opened one.
  *
- * THE TRADE-OFF, stated where the rule is: the same-page criterion catches the
- * "a page carries both a `header` and a same-text heading" shape, and misses the
- * shape where a page has no `header` block at all yet its heading is a running head
- * anyway. That miss is unlikely - the pages where it matters are chapter first
- * pages, and this layout does not print a running head there - and the failure
- * direction is the acceptable one: a missed demotion leaves one extra short
- * chapter, while a wrong demotion deletes a real chapter title and folds its text
- * into the chapter before it. One short chapter is far easier to notice and repair
- * than a book that lost its table of contents.
+ * Why criterion 2 needs BOTH halves. The book-wide half alone is the rule that
+ * destroyed a real book: in 《巴布尔回忆录》 the running head and the chapter title
+ * are THE SAME TEXT (「回历九〇X年(公元 …)的事件」 is printed in the margin of every
+ * continuation page and centered as the chapter title on the chapter's first page,
+ * which prints no running head), so a book-wide set of header texts matched every
+ * one of those titles: of the 9 year-heading `h1`s in the first 190 cached pages
+ * only 1 survived and the book came out with 2 chapters where it should have had a
+ * dozen. The name half alone is no better - two consecutive chapters may carry the
+ * same title by design (the 人名 index of every chapter is titled 「人 名」, scenario
+ * (ai)), and only a running head of that same text says the second one is page
+ * furniture rather than a chapter. ANDed the two halves are exact: a year-chapter
+ * title IS a running head but is NOT the name of the chapter before it (every year
+ * has its own title), while a running head mistyped as a title on a page with no
+ * `header` is necessarily the name of the chapter it interrupts.
  *
- * A repeated chapter-level title is NOT demoted. "Keep only the first occurrence of
- * an identical title" was the old fallback for a book whose model never typed
- * `header` at all, and it destroyed real structure: an index section is titled
- * 「人 名」 in every chapter's index, and the second one lost its heading. Being
- * printed more than once is not evidence of page furniture; being printed on a page
- * that also carries a `header` of the same text is.
+ * So the book is scanned twice: once up front to collect the `header` keys of the
+ * WHOLE book (one cheap O(pages) pass, criterion 2's second half), and then page
+ * by page, each page collecting its own `header` keys before its blocks are walked
+ * (criterion 1, and criterion 2's first half comes from the heading kept last).
+ *
+ * "The chapter that is currently open at its own level" is read here as the most
+ * recent KEPT chapter-level heading of the same level (`h1` against `h1`, `h2`
+ * against `h2`), with the deeper levels forgotten as soon as a shallower chapter
+ * opens. `flattenPages` does not know the caller's `splitLevel`, and at the default
+ * (`splitLevel: 2`) every `h1` and `h2` opens a chapter, which makes this reading
+ * identical to the outline's "previous sibling or ancestor" position. With
+ * `splitLevel: 1` an `h2` stays inside its chapter, so this reading is one heading
+ * coarse - the cost is at most one demoted section heading that would also have
+ * had to be the previous heading's exact name AND printed as a running head
+ * somewhere, and it is stated here rather than threading the option through a
+ * function whose job is the block list.
+ *
+ * THE TRADE-OFF, stated where the rule is: what the two criteria still miss is a
+ * heading whose page prints no `header` AND whose text differs from the open
+ * chapter's title - e.g. a running head of the PREVIOUS chapter left at the top of
+ * a page that starts the next one. The failure direction is the acceptable one: a
+ * missed demotion leaves one extra short chapter, while a wrong demotion deletes a
+ * real chapter title and folds its text into the chapter before it. One short
+ * chapter is far easier to notice and repair than a book that lost its table of
+ * contents.
+ *
+ * A repeated chapter-level title is NOT demoted on repetition alone. "Keep only the
+ * first occurrence of an identical title" was the old fallback for a book whose
+ * model never typed `header` at all, and it destroyed real structure: an index
+ * section is titled 「人 名」 in every chapter's index, and the second one lost its
+ * heading. Being printed more than once is not evidence of page furniture; being
+ * printed on a page that also carries a `header` of the same text is, and so is
+ * repeating the open chapter's name when that name is printed as a running head
+ * somewhere in the book.
  *
  * The comparison uses {@link headingKey} keys rather than raw strings, so the same
  * printed line matches across the model's re-typesetting: whitespace (including
@@ -370,7 +405,7 @@ const CHAPTER_HEADING_LEVELS = new Set(['h1', 'h2'])
  * documented on {@link headingKey}.
  *
  * @param {{ page: number, blocks: {type: string, text: string, continues?: boolean, bbox?: number[], image?: string}[] }[]} pages - pages in order.
- * @returns {{ blocks: { type: string, text: string, page: number, continues?: boolean, bbox?: number[], image?: string }[], dropped: number, joined: number, rejectedJoins: number, demotedHeadings: number }} `demotedHeadings` counts headings dropped because their own page also carried a `header` of the same text.
+ * @returns {{ blocks: { type: string, text: string, page: number, continues?: boolean, bbox?: number[], image?: string }[], dropped: number, joined: number, rejectedJoins: number, demotedHeadings: number }} `demotedHeadings` counts chapter-level headings dropped by the two running-head criteria (same page as a same-text `header`, or the open chapter's name while that name is printed as a `header` somewhere in the book).
  */
 export function flattenPages(pages) {
   const blocks = []
@@ -387,7 +422,7 @@ export function flattenPages(pages) {
   // is kept (pushed or appended to).
   const gapTypes = []
 
-  /* ------------ the running head of a page is only that page's business ------------ */
+  /* ------------ the running heads of the book, and the chapter open at each level ------------ */
   // DELIBERATE: the keys are built from each block's own `text`, i.e. the full
   // transcription of the printed line (49 characters for the pilot book's running
   // head). This must never reuse the pipeline's `furnitureHint`, which is
@@ -395,6 +430,32 @@ export function flattenPages(pages) {
   // a 40-character prefix no heading can ever equal, so the demotion would silently
   // stop matching exactly the long running heads it exists for - test/e2e.mjs
   // scenario (am) is the page that is 60+ characters long.
+  //
+  // The book-wide set below is criterion 2's second half and is built ONCE, before
+  // any page is walked: it only ever answers "is this text printed as a running head
+  // anywhere in this book", which is a property of the whole document. It is never
+  // used on its own - the same page's set is criterion 1, and criterion 2 also
+  // demands that the heading repeat the open chapter's title. See the two criteria
+  // on `flattenPages`.
+  const bookHeaderKeys = new Set()
+  for (const page of pages) {
+    for (const block of page.blocks) {
+      if (block.type !== 'header') continue
+      const key = headingKey(block.text)
+      if (key !== '') bookHeaderKeys.add(key)
+    }
+  }
+  // The title key of the chapter that is open at each chapter level: `1` for the
+  // h1 chapter, `2` for the h2 chapter inside it. `''` means "no chapter of that
+  // level has opened yet". A heading is compared against the entry of ITS OWN
+  // level, because that is the chapter a running head repeats: page 701 of
+  // 《巴布尔回忆录》 opens 「索引与译名对照」 as `h1` and then 「人 名」 as `h2`, so
+  // the `h1` on page 704 is a SIBLING of the first `h1` - comparing it against the
+  // immediately preceding chapter (`人 名`) could never match, and the duplicate
+  // chapter survived. A kept chapter also CLOSES the levels below it, so the next
+  // `h2` starts its own chapter instead of "repeating" a section title of the
+  // chapter before.
+  const openChapterKeys = new Map()
   const append = (previous, text, pageNumber) => {
     const piece = text.replace(/^[ \t]+/, '')
     // Verse keeps its line break; a torn paragraph is reflowed by smartJoin.
@@ -421,10 +482,10 @@ export function flattenPages(pages) {
     // The folios of *this* page, collected once before the blocks are visited,
     // so the order the model put the page number in cannot matter.
     const folioTokens = collectFolioTokens(page.blocks)
-    // The running heads of *this* page, for the same reason: a heading is judged
-    // against its own page only, so the set is built before the blocks are walked
-    // and never survives the page. Judging against the whole book would delete
-    // real chapter titles - see the trade-off on `flattenPages`.
+    // The running heads of *this* page, for the same reason: the first criterion
+    // judges a heading against its own page only, so this set is built before the
+    // blocks are walked and never survives the page. It is the book-wide set above
+    // that a heading has to match as well before a same-name heading is demoted.
     const pageHeaderKeys = new Set()
     for (const block of page.blocks) {
       if (block.type !== 'header') continue
@@ -433,15 +494,25 @@ export function flattenPages(pages) {
     }
     for (const block of page.blocks) {
       if (DROP_TYPES.has(block.type)) { dropped += 1; gapTypes.push(block.type); continue }
-      // A chapter-level heading that repeats this page's `header` is furniture the
-      // model mistyped. It leaves the book exactly like the `header` block it
-      // should have been: counted in `dropped` (it is furniture) and again in
-      // `demotedHeadings`, which is the number the report shows so the defect is
-      // visible rather than silent. A heading with no such partner on its page is
-      // a real chapter title and is kept, whatever else the book printed.
+      // A chapter-level heading that repeats this page's `header` - or that repeats
+      // the open chapter's name while that name is a running head somewhere in the
+      // book - is furniture the model mistyped. It leaves the book exactly like the
+      // `header` block it should have been: counted in `dropped` (it is furniture)
+      // and again in `demotedHeadings`, which is the number the report shows so the
+      // defect is visible rather than silent. A heading that satisfies neither
+      // criterion is a real chapter title and is kept, whatever else the book
+      // printed.
       if (CHAPTER_HEADING_LEVELS.has(block.type)) {
         const key = headingKey(block.text)
-        if (key !== '' && pageHeaderKeys.has(key)) {
+        const level = Number(block.type.slice(1))
+        const samePageHead = key !== '' && pageHeaderKeys.has(key)
+        // Both halves of criterion 2, spelled out: the name of the chapter that is
+        // open AT THIS LEVEL, AND evidence that this name is printed as a running
+        // head somewhere. Either half alone is wrong on real data - see
+        // `flattenPages`.
+        const repeatsOpenChapter = key !== '' && key === (openChapterKeys.get(level) ?? '')
+          && bookHeaderKeys.has(key)
+        if (samePageHead || repeatsOpenChapter) {
           dropped += 1
           demotedHeadings += 1
           // It is a heading that USED to stand between the paragraphs: even
@@ -450,6 +521,13 @@ export function flattenPages(pages) {
           gapTypes.push(block.type)
           continue
         }
+        // A kept chapter-level heading opens a chapter: it becomes what the next
+        // heading of its own level is compared against, and it closes the deeper
+        // levels the chapter before it had opened.
+        for (const deeper of [...openChapterKeys.keys()]) {
+          if (deeper > level) openChapterKeys.delete(deeper)
+        }
+        openChapterKeys.set(level, key)
       }
       const raw = String(block.text ?? '')
       const text = FOLIAGE_TYPES.has(block.type) ? stripFoliage(raw, folioTokens) : raw
@@ -665,12 +743,32 @@ const WHITESPACE_CHAR = /[\s\u3000]/
 const LIST_MARK = new Set([',', '，', '、', ';', '；'])
 
 /**
- * Words that turn a neighbouring number into a date, a directed reference or a
+ * Words that turn a neighbouring NUMBER into a date, a directed reference or a
  * volume: `年` `月` `日` `时` `分` `秒` make `9` the ninth month or day, `页` `卷`
- * `章` `节` make `135` a cross-reference (`第 135 页`). A number beside one of
- * them is never a margin mark, whatever else it looks like.
+ * `章` `节` make `135` a cross-reference (`第 135 页`). A NUMBER beside one of
+ * them is never a margin mark.
+ *
+ * "Number" is literal, and {@link PURE_DIGITS} is what enforces it: this set only
+ * protects a token made of digits. A leaf mark - one to four digits and a letter,
+ * `175b` - is not a year, a month, a day or a volume number, so the unit beside it
+ * is ordinary prose and the mark still has to go. Page 309 of 《巴布尔回忆录》
+ * prints `当我在回历九一七年 175b (公元 1511 年)夺取撒马尔罕时`, and reading the
+ * `年` before the mark as a date context kept it in the finished book.
  */
 const DATE_UNIT = new Set(['年', '月', '日', '时', '分', '秒', '页', '卷', '章', '节'])
+
+/**
+ * A token that is nothing but digits - the only shape {@link DATE_UNIT} speaks
+ * about, and the only shape a date, a month, a day or a page reference is printed
+ * in.
+ *
+ * Full-width digits count: {@link normalizePunctuation} re-typesets `１５２９` to
+ * `1529` before the book is rendered, so the two widths are the same number, and
+ * this guard is one-sided on purpose - it can only refuse a deletion. A leaf mark
+ * (`175b`) never matches, which is exactly the point: a letter suffix cannot be a
+ * year or a month, so the date guard must not hide it.
+ */
+const PURE_DIGITS = /^[0-9\uff10-\uff19]+$/
 
 /**
  * The three entry shapes the index of this book prints, used by the index guard.
@@ -906,6 +1004,15 @@ function citedBefore(text, at) {
  * chooses cleaning over keeping. Guard 4 covers the reference shapes that carry
  * their own evidence; a bare number in Chinese prose carries none.
  *
+ * KNOWN TRADE-OFF, accepted and NOT to be "fixed" by loosening guard 3: a leaf
+ * mark wedged INSIDE a broken Latin word keeps its token - page 419 of
+ * 《巴布尔回忆录》 prints `静修之所(hu- 233a jra)`, where the mark is spliced into
+ * the middle of `hu-…-jra`, so both neighbours are Latin and there is no CJK
+ * context to prove anything. Guard 3 is the main defence against deleting real
+ * citations (a previous version of this rule deleted 1650 index locators), so one
+ * surviving mark in 764 pages is the price of keeping the guard. The form
+ * `(hu- NNNx jra)` is therefore expected to stay in the book.
+ *
  * @param {string} text - block text.
  * @param {number} at - index of the token's first character.
  * @param {number} end - index just past the token.
@@ -985,19 +1092,27 @@ function followsListMark(text, at, end) {
 
 /**
  * True when the token is a date, a directed page reference or a volume number
- * (position guard 3): the nearest non-blank neighbour is one of {@link DATE_UNIT}.
+ * (position guard 3): the token is a pure number ({@link PURE_DIGITS}) and its
+ * nearest non-blank neighbour is one of {@link DATE_UNIT}.
  *
  * `公元 1529 年 9 月 7 日` reads as `9` next to `年` and `月`; `第 135 页` reads
  * as `135` next to `页`. None of those numbers may be deleted, and the guard is
- * asked by BOTH rules, because a leaf-shaped token can sit in a date too
- * (`回历九一七年 175b`).
+ * asked by BOTH rules, because a leaf-shaped token can sit in a date too.
+ *
+ * BUT ONLY A PURE NUMBER IS PROTECTED. `回历九一七年 175b` puts a leaf mark next
+ * to `年`, and `175b` is not a year: a token with a letter suffix cannot be a
+ * year, a month, a day, a volume or a page reference, so the unit beside it says
+ * nothing about it. The guard therefore returns false for anything that is not
+ * {@link PURE_DIGITS}, and the leaf rule's other guards (shape, CJK context,
+ * citation) decide. This is the `175b` on page 309 of 《巴布尔回忆录》.
  *
  * @param {string} text - block text.
  * @param {number} at - index of the token's first character.
  * @param {number} end - index just past the token.
- * @returns {boolean} true when a date/reference unit is adjacent.
+ * @returns {boolean} true when a date/reference unit is adjacent to a pure number.
  */
 function inDateContext(text, at, end) {
+  if (!PURE_DIGITS.test(text.slice(at, end))) return false
   const { left, right } = edgeCharacters(text, at, end)
   return DATE_UNIT.has(left) || DATE_UNIT.has(right)
 }
@@ -1044,8 +1159,16 @@ function keepsFolio(text, at, end) {
 }
 
 /**
- * The position guards of the LEAF rule: a leaf-shaped token beside a date unit or
- * inside an index entry is book text, not a margin mark.
+ * The position guards of the LEAF rule: a leaf-shaped token inside an index entry
+ * is book text, not a margin mark.
+ *
+ * The date guard ({@link inDateContext}) is still asked, but it can no longer
+ * refuse a leaf mark: it only speaks about pure numbers ({@link PURE_DIGITS}), and
+ * a leaf mark carries a letter suffix, so `回历九一七年 175b` loses its token
+ * (page 309 of 《巴布尔回忆录》). The guard stays in the chain because the shape
+ * this function is handed is the shape it was written for; a pure number never
+ * reaches the leaf rule, so the date branch here is dead for it and documented
+ * rather than removed.
  *
  * The list/position guards of {@link keepsFolio} are NOT repeated here and must
  * not be: a margin mark of this book is overwhelmingly printed right behind a
@@ -1169,8 +1292,8 @@ function removeFolioToken(text, token, options = {}) {
  *
  * Both rules also ask the POSITION guards ({@link keepsFolio} / {@link keepsLeafMark}),
  * and those are the newest addition: a token is a margin mark only where the margin
- * prints it. The equality rule refuses a token beside `年` `月` `日` `时` `分` `秒`
- * `页` `卷` `章` `节` (position guard 3), a token that is not alone at an edge or
+ * prints it. The equality rule refuses a PURE NUMBER beside `年` `月` `日` `时` `分`
+ * `秒` `页` `卷` `章` `节` (position guard 3), a token that is not alone at an edge or
  * between two spaces (position guard 1), a token whose nearest non-blank neighbour
  * is list punctuation `,` `，` `、` `;` `；` (position guard 2), and a token inside
  * an index entry (position guard 4). The shape rule refuses the date and index ones

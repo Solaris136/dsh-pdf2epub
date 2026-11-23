@@ -1,0 +1,5 @@
+# Normalise every text file to LF in the working tree. Windows checkouts
+# otherwise inherit Git for Windows' `core.autocrlf=true`, which turns a CI run
+# into a different-input run (the harness slices `client.js` between markers
+# that span a newline).
+* text=auto eol=lf

@@ -1,0 +1,125 @@
+name: CI
+
+# Every merge into `main` must come from a PR whose latest run of this workflow is
+# green: branch protection requires the single aggregate check `ci-ok`. The jobs
+# below are the evidence behind it.
+#
+#   static  syntax / manifest / locale parity / npm-pack allowlist
+#   test    the four `npm test` suites + nine `npm run test:harness` suites,
+#           on Linux (Node 20, 22, 24) and Windows (Node 24)
+#   ci-ok   aggregate gate, the only required status check
+#
+# See docs/CI.md for the gate rules and how to reproduce a failure locally.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CI: 'true'
+  npm_config_fund: 'false'
+  npm_config_audit: 'false'
+  npm_config_update_notifier: 'false'
+
+jobs:
+  static:
+    name: static
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out the pull request
+        uses: actions/checkout@v7
+
+      - name: Set up Node.js 24
+        uses: actions/setup-node@v7
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: package-lock.json
+
+      - name: Install locked dependencies
+        run: npm ci
+
+      - name: Syntax, manifest and locale parity
+        run: npm run check:syntax
+
+      - name: Packaging allowlist (`npm pack` contents)
+        run: npm run check:package
+
+  test:
+    name: test (${{ matrix.os }}, node ${{ matrix.node }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            node: '20'
+          - os: ubuntu-latest
+            node: '22'
+          - os: ubuntu-latest
+            node: '24'
+          - os: windows-latest
+            node: '24'
+    env:
+      # Fail instead of silently skipping the real-Chromium parse layer: the
+      # hosted images ship Chrome (Linux) and Edge (Windows). docs/CI.md#browser.
+      PDF2EPUB_REQUIRE_BROWSER: '1'
+    steps:
+      - name: Check out the pull request
+        uses: actions/checkout@v7
+
+      - name: Set up Node.js ${{ matrix.node }}
+        uses: actions/setup-node@v7
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+          cache-dependency-path: package-lock.json
+
+      - name: Install locked dependencies
+        run: npm ci
+
+      - name: Show runner versions
+        run: node --version && npm --version
+
+      - name: Logic, EPUB, hardening and end-to-end suites
+        run: npm test
+
+      - name: Host, client, preview, route and security harnesses
+        run: npm run test:harness
+
+  ci-ok:
+    name: ci-ok
+    # Runs even when an upstream job fails or is cancelled, so the required
+    # check reports a failure instead of staying pending forever.
+    if: always()
+    needs: [static, test]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Fail unless every required job succeeded
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+        run: |
+          node --input-type=module -e '
+            const needs = JSON.parse(process.env.NEEDS)
+            const entries = Object.entries(needs)
+            for (const [job, info] of entries) console.log(`${job}: ${info.result}`)
+            const failed = entries.filter(([, info]) => info.result !== "success")
+            if (failed.length > 0) {
+              console.error(`CI gate failed: ${failed.map(([job, info]) => `${job}=${info.result}`).join(", ")}`)
+              process.exit(1)
+            }
+            console.log("CI gate passed")
+          '

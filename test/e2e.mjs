@@ -2933,8 +2933,9 @@ async function scenarioBookDirectory() {
  * sanitised - and since the input file cannot carry the illegal characters, the
  * illegal cases are unit-tested against the exported `bookDirectoryName()`, which
  * is the function the pipeline itself calls. The length cap IS exercised end to
- * end: a 125-character file name is a legal input, so a real conversion proves the
- * directory name is cut to 100 characters with the head kept.
+ * end: the fixture name stays inside the file system's per-component byte limit
+ * (255 bytes on ext4/APFS) yet exceeds the 100-character cap, so a real conversion
+ * proves the directory name is cut to 100 characters with the head kept.
  */
 async function scenarioDirectoryNameSanitizer() {
   const sanitize = name => pipeline.bookDirectoryName(name)
@@ -2959,7 +2960,11 @@ async function scenarioDirectoryNameSanitizer() {
   expect('(ae) 只有点的名字回退为 book', sanitize('...'), 'book')
 
   // End to end: a legal but very long input file name is truncated on the real path.
-  const longStem = `很长的书名${'甲'.repeat(120)}`
+  // 111 characters but 221 UTF-8 bytes: longer than the 100-character cap, inside
+  // the 255-byte NAME_MAX of ext4/APFS, so the fixture is portable. A 100%-CJK name
+  // of the same character count would be 333 bytes and fail with ENAMETOOLONG on
+  // POSIX before the code under test ever runs.
+  const longStem = `很长的书名${'甲'.repeat(50)}${'x'.repeat(56)}`
   const longFile = path.join(OUT, `${longStem}.pdf`)
   await writeFile(longFile, buildMultiPagePdf([['Long-name fixture, page one.']]))
   const longRun = await pipeline.runConversion({

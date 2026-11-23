@@ -1,5 +1,7 @@
 # dsh-pdf2epub
 
+[![CI](https://github.com/Solaris136/dsh-pdf2epub/actions/workflows/ci.yml/badge.svg)](https://github.com/Solaris136/dsh-pdf2epub/actions/workflows/ci.yml)
+
 把整本 PDF 转成可重排 EPUB 3 的 DSH 插件：每页渲染成图交给视觉模型转录，弱页自动多模型交叉复核，逐页磁盘缓存可断点续跑，最后连 token 账单一起交代。
 
 - **一本一目录**：一本书的全部产物落在 `<PDF 所在目录>/<PDF 文件名>/` 里——EPUB、两个 JSON 边车、`pages/` 页缓存、`images/` 插图。一起找得到，一起删得掉。
@@ -172,12 +174,22 @@ pages: "1-40"  →  pages: "41-80"  →  …  →  pages: "1-764"
 ## 测试
 
 ```bash
+npm ci               # 锁文件安装（CI 用的就是这一步）
+npm run ci           # 完整门禁：check + test + test:harness
 npm test             # 逻辑层 + EPUB + 加固 + e2e（4 套）
 npm run test:harness # 宿主路由 / 客户端 / 预览 / 模型选择 / 文件选择器 / 安全（9 套）
+npm run check        # 静态检查 + npm pack 清单（不联网、不发模型调用）
 ```
 
-`npm test`：`src/model/test.mjs`（51）、`src/epub/test.mjs`（30）、`src/epub/hardening.test.mjs`（30）、`test/e2e.mjs`（50 场景 507 检查）。
-`npm run test:harness`：`host-check`（43）、`epub-route-check`（18）、`client-check`（16）、`locale-check`（5）、`preview-check`（11）、`route-path`（10）、`security-check`（76，本机无 Edge/Chrome 时浏览器层 SKIP）、`model-select-check`、`picker-check`（后两者只打印 OK，不打条数）。脚本在 `test/harness/`，产物写 `.out/`（已 gitignore）；需要样例书的脚本用 `src/epub/build.js` 运行时自建。`pretest`（`node src/pdf/smoke.mjs`）生成 e2e 需要的 `.out/test.pdf` 与 `.out/test-long.pdf`。
+`npm test`：`src/model/test.mjs`（51）、`src/epub/test.mjs`（30）、`src/epub/hardening.test.mjs`（30）、`test/e2e.mjs`（58 场景 550 检查）。
+`npm run test:harness`：`host-check`（43）、`epub-route-check`（18）、`client-check`（16）、`locale-check`（5）、`preview-check`（11）、`route-path`（10）、`security-check`（76，本机无 Edge/Chrome 时浏览器层 SKIP；设置 `PDF2EPUB_REQUIRE_BROWSER=1` 则找不到浏览器即失败）、`model-select-check`、`picker-check`（后两者只打印 OK，不打条数）。脚本在 `test/harness/`，产物写 `.out/`（已 gitignore）；需要样例书的脚本用 `src/epub/build.js` 运行时自建。`pretest`（`node src/pdf/smoke.mjs`）生成 e2e 需要的 `.out/test.pdf` 与 `.out/test-long.pdf`。
+`npm run check`：`test/ci/check-static.mjs` 用 `node --check` 解析全部 29 个 JS 模块，校验两个 locale 的键与占位符对齐、`package.json` / `index.js` / `cordis.patch.yml` / 锁文件四处身份一致、`exports` 与 `files` 条目落盘存在；`test/ci/check-package.mjs` 读 `npm pack --dry-run` 的真实清单，要求 17 个运行时条目在包里且不混入 `notes/`、`test/`、`.github/`、`.out/`、PDF/EPUB 产物。
+
+## 持续集成与合并门禁
+
+`.github/workflows/ci.yml` 在 `push: main`、`pull_request: main` 和手动触发时运行：`static`（静态 + 打包清单）、`test`（Linux Node 20/22/24 + Windows Node 24 跑完整两套测试，真浏览器解析层强制开启）、`ci-ok`（聚合门禁）。
+
+`main` 已开启分支保护：只能通过 PR 合入，必须 `ci-ok` 为绿且分支基于最新 `main`，管理员也不能绕过；禁止 force push 与删除分支。也就是**CI 不过，合不进去**。本地复现、改 CI 的注意点和失败排查见 [docs/CI.md](docs/CI.md)。
 
 ## 许可证
 

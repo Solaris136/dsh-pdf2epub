@@ -1,0 +1,84 @@
+name: Publish to npm
+
+# A published GitHub Release is the only way a version reaches the npm registry.
+# The job proves that the release tag names a commit on `main`, that
+# `package.json` agrees with the tag, and that the package still passes its
+# packaging gates, then publishes with provenance through npm trusted
+# publishing (OIDC). No npm token is stored in this repository.
+#
+# Setup and recovery: docs/RELEASE.md.
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag to publish (for example v0.0.1)
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: npm-publish-${{ github.event.release.tag_name || inputs.tag }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: publish
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out the release tag
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.release.tag_name || inputs.tag }}
+          fetch-depth: 0
+
+      - name: Set up Node.js 24
+        uses: actions/setup-node@v7
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: package-lock.json
+          registry-url: 'https://registry.npmjs.org'
+
+      - name: Prove the tag, the version and the branch
+        env:
+          TAG: ${{ github.event.release.tag_name || inputs.tag }}
+        run: |
+          set -euo pipefail
+          echo "tag=$TAG"
+          node --input-type=module -e '
+            import fs from "node:fs"
+            const tag = process.env.TAG ?? ""
+            const version = tag.replace(/^v/, "")
+            if (version === "" || version === tag) {
+              console.error(`::error::${tag || "(no tag)"} is not a v-prefixed release tag`)
+              process.exit(1)
+            }
+            const pkg = JSON.parse(fs.readFileSync("package.json", "utf8"))
+            if (pkg.version !== version) {
+              console.error(`::error::tag ${tag} names ${version} but package.json says ${pkg.version}`)
+              process.exit(1)
+            }
+            console.log(`package.json version ${version} matches the tag`)
+          '
+          git fetch --no-tags origin main
+          git merge-base --is-ancestor HEAD origin/main
+          echo "the release commit is on main"
+
+      - name: Show tool versions
+        run: node --version && npm --version
+
+      - name: Install locked dependencies
+        run: npm ci
+
+      - name: Static, manifest and packaging gates
+        run: npm run check
+
+      - name: Publish with provenance
+        run: npm publish --provenance --access public

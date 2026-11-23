@@ -119,3 +119,12 @@ e2e 需要的 `.out/test.pdf` 与 `.out/test-long.pdf`，所以单独跑 `test/e
    默认 `core.autocrlf=true`，曾让 `security-check` 的区域切片找不到跨行标记——只在 Windows 上挂、且报
    「section banners / normalizeBook not found」时先查这条。
 7. **重跑**：Actions 页面 → 该次运行 → Re-run failed jobs；或推送新提交触发新一轮。
+
+## 8. 发布（npm）
+
+`.github/workflows/publish.yml` 只在**发布 GitHub Release**时运行，和本文件的三个 job 相互独立：
+`ci-ok` 保证合入的是绿的提交，`publish.yml` 再校验 tag 与 `package.json` 版本一致、release 提交在
+`main` 上，然后走 npm trusted publishing（OIDC）发布。本地没有可保存的发布令牌，也不需要。
+
+版本怎么升、怎么打 Release、发布失败了怎么补：见 `docs/RELEASE.md`。
+

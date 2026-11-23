@@ -1,6 +1,6 @@
 {
   "name": "dsh-pdf2epub",
-  "version": "0.1.0",
+  "version": "0.0.1",
   "description": "Fully automatic PDF to EPUB 3 plugin for DeepSeek Harness: page-by-page vision-model transcription, multi-model cross review, semantic EPUB assembly, token accounting.",
   "license": "Apache-2.0",
   "repository": {

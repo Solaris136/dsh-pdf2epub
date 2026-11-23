@@ -77,6 +77,7 @@ LTS 线，Windows 只跑 24 是因为 Windows 相关代码（路径折叠、平�
 - **Require status checks to pass**：必选检查 `ci-ok`，并勾选 **Require branches to be up to date
   before merging**（strict）——分支落后于 `main` 时要先 rebase/merge 再等一轮 CI。
 - **Do not allow bypassing**（`enforce_admins: true`）：管理员同样受约束。
+- **合并方式：只允许 Rebase and merge / Squash and merge**，禁止 merge commit。`main` 的历史必须是一条直线，`git log --merges` 永远是空的；GitHub 仓库设置里关掉 “Allow merge commits”，本地等价规则是 `git config merge.ff only` + `git config pull.rebase true`（本仓库已写入 `.git/config`）。多文件、多主题的改动允许拆成多个提交，但每个提交都必须能独立通过 `npm run ci`，因为它们都会直接落在 `main` 上。
 - 禁止 force push、禁止删除 `main`；要求 PR 对话全部已解决。
 - 不要求 reviewer 批准（单人仓库无法给自己批准），门禁是**绿色 `ci-ok` + 最新基线**。
 

@@ -204,7 +204,7 @@ npm run check        # 静态检查 + npm pack 清单（不联网、不发模型
 
 `.github/workflows/ci.yml` 在 `push: main`、`pull_request: main` 和手动触发时运行：`static`（静态 + 打包清单）、`test`（Linux Node 20/22/24 + Windows Node 24 跑完整两套测试，真浏览器解析层强制开启）、`ci-ok`（聚合门禁）。
 
-`main` 已开启分支保护：只能通过 PR 合入，必须 `ci-ok` 为绿且分支基于最新 `main`，管理员也不能绕过；禁止 force push 与删除分支。也就是**CI 不过，合不进去**。本地复现、改 CI 的注意点和失败排查见 [docs/CI.md](docs/CI.md)。
+`main` 已开启分支保护：只能通过 PR 合入，必须 `ci-ok` 为绿且分支基于最新 `main`，管理员也不能绕过；禁止 force push 与删除分支。合并方式固定为**平铺**（Rebase / Squash and merge，禁止 merge commit），`main` 的历史是一条直线、没有 merge 节点。也就是**CI 不过，合不进去**。本地复现、改 CI 的注意点和失败排查见 [docs/CI.md](docs/CI.md)。
 
 ## 许可证
 

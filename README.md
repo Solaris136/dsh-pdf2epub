@@ -49,6 +49,13 @@ flowchart TD
 1. DSH 的 Plugins 页点「添加插件」，选择本仓库目录；
 2. 或让 agent 调 `plugin_manager`，`action: "install_bundle"`，`target` 指向本仓库绝对路径。
 
+发布版也可以从 npm 安装：
+
+1. DSH 的 Plugins 页点「添加插件」，填 `dsh-pdf2epub`；
+2. 或 `plugin_manager` 的 `install_bundle`，`target` 填 `dsh-pdf2epub`（要钉版本就写 `dsh-pdf2epub@0.0.1`）。
+
+npm 上的 `0.0.0` 是最早的空占位包，没有代码；`latest` 从 `0.0.1` 起才是插件本体。发布由 GitHub Release 触发，流程见 [docs/RELEASE.md](docs/RELEASE.md)。
+
 运行时依赖 `mupdf`（渲染与文本层）和 `fflate`（EPUB 打包），随插件安装。
 
 **必须配置 `primaryModel` 才能转换。** 留空不阻止插件加载，面板照常出现；点「开始转换」时才报 `primaryModel is not configured`。单次调用传 `model` 可以覆盖配置。

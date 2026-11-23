@@ -16,11 +16,13 @@
  *   OEBPS/text/<id>.xhtml        (one XHTML5 document per chapter)
  *   OEBPS/<asset path>           (cover image + assets, bytes written verbatim)
  *
- * Reproducibility: `dcterms:modified` defaults to a fixed timestamp and every
+ * Reproducibility: `dcterms:modified` falls back to a fixed timestamp and every
  * zip entry gets one fixed, locally-constructed mtime, so two builds of the
  * same book (with an explicit `identifier`) are byte-identical — in any time
  * zone. Only the auto-generated `urn:uuid:` identifier is random, as required
- * by the contract.
+ * by the contract. A caller that wants a *real* modification date (the pipeline
+ * does) passes `book.modified` as a `Date` or an ISO 8601 string; the value is
+ * kept to the second and normalised to `YYYY-MM-DDThh:mm:ssZ`.
  *
  * Hardening (see docs/review-epub.md):
  *   S1  ZIP_MTIME is built from local date parts, so it encodes the same DOS
@@ -45,7 +47,15 @@ import { DEFAULT_CSS } from './css.js';
 
 /** Value of the uncompressed `mimetype` entry. */
 export const EPUB_MIMETYPE = 'application/epub+zip';
-/** Fixed fallback for `dcterms:modified`; keeps builds reproducible. */
+/**
+ * Fallback for `dcterms:modified` when `book.modified` is absent.
+ *
+ * The fixed epoch, not the wall clock: a build with an explicit `identifier` is
+ * byte-reproducible only if every metadata field is, and a caller that wants the
+ * real date (the EPUB pipeline passes the source file's mtime) supplies it. The
+ * OPF therefore never claims the book was modified in 1970 *unless* the caller
+ * asked for no date at all.
+ */
 export const DEFAULT_MODIFIED = '1970-01-01T00:00:00Z';
 /** Fallback language when the caller omits it (Chinese-first module). */
 export const DEFAULT_LANGUAGE = 'zh-CN';

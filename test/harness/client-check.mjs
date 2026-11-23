@@ -282,7 +282,7 @@ check('5. empty state: intro copy, disabled start, advanced collapsed', () => {
   assert.ok(texts.includes('转换完成后，可在这里直接阅读成书'), 'reading-area empty hint missing')
 })
 
-check('6. path filled enables start; 「高级」 reveals the four optional fields', () => {
+check('6. path filled enables start; 「高级」 reveals the three optional fields', () => {
   first.react.begin()
   first.react.slots[0] = 'C:\\Work\\book.pdf'
   const filled = Panel()
@@ -305,9 +305,15 @@ check('6. path filled enables start; 「高级」 reveals the four optional fiel
   const advancedInputs = []
   walk(advanced, (element) => { if (element.type === 'input') advancedInputs.push(element) })
   const placeholders = advancedInputs.map(element => element.props.placeholder)
+  // No `remote` service in this context, so the model catalogue is unavailable
+  // and the model field is the plain text input (the dropdown path is covered
+  // by model-select-check.mjs).
   assert.ok(placeholders.includes('留空则使用插件配置的默认模型'), 'model field missing')
-  assert.ok(placeholders.includes('provider/model，多个用逗号分隔；留空则不做交叉复核'), 'review-model field missing')
-  assert.equal(advancedInputs.length, 5, 'path + four advanced inputs')
+  assert.ok(
+    !placeholders.includes('provider/model，多个用逗号分隔；留空则不做交叉复核'),
+    'the review-model field must be gone from the panel',
+  )
+  assert.equal(advancedInputs.length, 4, 'path + three advanced inputs')
 })
 
 check('7. reading typography: 17px / 1.8 / 2em indent / 42em, headings flush', () => {

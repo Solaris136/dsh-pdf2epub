@@ -2,16 +2,23 @@
  * Self-test for the pdf2epub Host entry (`index.js` + `src/host/server.js`).
  *
  * Runs the plugin's `apply` against a recording fake context, then drives every
- * registered route with a minimal request stub. No Host process and no model
- * call: the job test points at a PDF that does not exist, so the pipeline throws
- * before it ever asks for a vision model.
+ * registered route with a minimal request stub. The context carries no `jobs`
+ * service at all — that is the regression this file pins: a registered route is
+ * unowned, so a job controller bound to an agent can never be reached from it
+ * and the conversion has to run against `src/host/server.js`'s own state table.
+ *
+ * No Host process and no model call. The real executor is driven with a PDF that
+ * does not exist, so the pipeline fails before it ever asks for a vision model;
+ * the success path is driven through the `setConversionRunner` seam, which puts
+ * the real runner back when it is passed nothing.
  *
  * Usage: node test/harness/host-check.mjs
  */
 
 import assert from 'node:assert/strict'
-import { mkdir, readFile, unlink, writeFile } from 'node:fs/promises'
+import { mkdir, unlink, writeFile } from 'node:fs/promises'
 import path from 'node:path'
+import { setTimeout as delay } from 'node:timers/promises'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..')
@@ -23,9 +30,10 @@ const BOOK = '/dsh-pdf2epub/book'
 const FILE = '/dsh-pdf2epub/file'
 const EPUB = '/dsh-pdf2epub/epub'
 
+/** Largest job table the host layer keeps, mirrored from `src/host/server.js`. */
+const MAX_STATES = 50
+
 const recorded = { tools: [], routes: [], labels: [] }
-const started = new Map()
-let jobSequence = 0
 let passed = 0
 
 /* -------------------------------------------------------------------------- */
@@ -48,6 +56,13 @@ function requestRejection(request) {
   return undefined
 }
 
+/**
+ * The plugin context used by every route test.
+ *
+ * Deliberately has NO `jobs` member: `ctx.jobs.start` is what used to answer the
+ * panel's click with `500 … no job controller serves this agent`, and a route
+ * must not need one. `jobs` being absent here is the whole point of the suite.
+ */
 const ctx = {
   llm: {},
   attachments: {},
@@ -56,15 +71,6 @@ const ctx = {
     register(definition) {
       recorded.tools.push(definition)
       return () => {}
-    },
-  },
-  jobs: {
-    start(spec) {
-      jobSequence += 1
-      const id = `pdf2epub-test-${jobSequence}`
-      const hooks = spec.run({ id, append() {}, updateProgress() {} })
-      started.set(id, { spec, hooks })
-      return id
     },
   },
   webServer: {
@@ -144,6 +150,51 @@ function routeOf(target) {
   return route
 }
 
+/** Whether one phase can still move. */
+function isSettled(phase) {
+  return phase === 'done' || phase === 'failed' || phase === 'cancelled'
+}
+
+/**
+ * Wait until one job's record reaches a settled phase.
+ *
+ * Polls the module's own projection — the same one `GET /state` serves. An id
+ * that has left the table counts as settled too: only settled records are ever
+ * evicted, so its absence cannot hide a conversion that is still running.
+ *
+ * @param {string} jobId - id returned by `POST /run`.
+ * @param {number} [timeoutMs] - how long to wait before failing the assertion.
+ * @returns {Promise<object | undefined>} the settled projection, or `undefined` when evicted.
+ */
+async function settled(jobId, timeoutMs = 10000) {
+  const deadline = Date.now() + timeoutMs
+  for (;;) {
+    const state = serverModule.readJobState(jobId)
+    if (state === undefined) return undefined
+    if (isSettled(state.phase)) return state
+    if (Date.now() > deadline) assert.fail(`job ${jobId} did not settle in ${timeoutMs} ms (phase ${state.phase})`)
+    await delay(5)
+  }
+}
+
+/**
+ * Wait until one job's record satisfies a predicate.
+ *
+ * @param {string} jobId - job id.
+ * @param {(state: object) => boolean} predicate - condition to reach.
+ * @param {number} [timeoutMs] - how long to wait before failing the assertion.
+ * @returns {Promise<object>} the record that satisfied the predicate.
+ */
+async function untilState(jobId, predicate, timeoutMs = 10000) {
+  const deadline = Date.now() + timeoutMs
+  for (;;) {
+    const state = serverModule.readJobState(jobId)
+    if (state !== undefined && predicate(state)) return state
+    if (Date.now() > deadline) assert.fail(`job ${jobId} never reached the expected state (last: ${JSON.stringify(state)})`)
+    await delay(5)
+  }
+}
+
 /* -------------------------------------------------------------------------- */
 /* Run                                                                        */
 /* -------------------------------------------------------------------------- */
@@ -167,6 +218,7 @@ plugin.apply(ctx, CONFIG)
 console.log('=== plugin surface ===')
 console.log(`name       : ${plugin.name}`)
 console.log(`inject     : ${JSON.stringify(plugin.inject)}`)
+console.log(`jobs       : ${'jobs' in ctx ? 'present in the fake context' : 'absent — a route must not need one'}`)
 console.log(`Config     : ${plugin.Config === undefined ? 'undefined here (schemastery resolved only inside DSH; defaults merged in apply)' : 'schemastery z.object'}`)
 console.log(`effects    : ${recorded.labels.length} — ${recorded.labels.join(' | ')}`)
 console.log('')
@@ -178,7 +230,7 @@ assert.equal(tool.name, 'pdf2epub')
 ok('1  tools.register called once, tool name is pdf2epub')
 
 const paramKeys = Object.keys(tool.parameters.properties)
-assert.deepEqual(paramKeys, ['input', 'outputDir', 'model', 'reviewModels', 'dpi', 'maxTokens', 'concurrency', 'splitLevel', 'force'])
+assert.deepEqual(paramKeys, ['input', 'outputDir', 'model', 'reviewModels', 'dpi', 'maxTokens', 'concurrency', 'splitLevel', 'pages', 'excludePages', 'cover', 'title', 'author', 'publisher', 'force'])
 assert.deepEqual(tool.parameters.required, ['input'])
 ok('1b tool parameters match the contract', paramKeys.join(', '))
 
@@ -237,6 +289,12 @@ for (const route of recorded.routes) {
 }
 ok('2b /run is a handler (POST), the four readers are resources')
 
+/* The plugin must load without the `jobs` service (index.js used to inject it,
+ * and a composition without it then refused to load the plugin at all). */
+assert.deepEqual(plugin.inject.includes('jobs'), false, 'index.js must not inject the jobs service')
+assert.equal('jobs' in ctx, false)
+ok('2c index.js does not inject "jobs", and the context has none', `inject = ${plugin.inject.join(', ')}`)
+
 /* 3. fence: every route answers 403 to an empty request -------------------- */
 const fence = []
 for (const route of recorded.routes) {
@@ -274,12 +332,19 @@ const toolEpub = path.join(OUT, 'tool.epub')
 const toolReport = path.join(OUT, 'tool.report.json')
 const toolBook = path.join(OUT, 'tool.book.json')
 const foreignEpub = path.join(OUT, 'foreign.epub')
+const jobEpub = path.join(OUT, 'job.epub')
+const jobReport = path.join(OUT, 'job.report.json')
+const jobBook = path.join(OUT, 'job.book.json')
 const EPUB_BYTES = Buffer.from('PK\u0003\u0004fixture-epub-bytes', 'binary')
+const JOB_EPUB_BYTES = Buffer.from('PK\u0003\u0004job-epub-bytes', 'binary')
 const enc = value => encodeURIComponent(value)
 await mkdir(OUT, { recursive: true })
 await writeFile(bookFixture, '{"schema":"fixture","pages":1}\n')
 await writeFile(reportFixture, '{"schema":"fixture-report"}\n')
 await writeFile(epubFixture, EPUB_BYTES)
+await writeFile(jobEpub, JOB_EPUB_BYTES)
+await writeFile(jobReport, '{"schema":"job-report"}\n')
+await writeFile(jobBook, '{"schema":"job-book"}\n')
 /* A real EPUB the plugin never produced: self-built here so the "foreign file"
  * assertion does not depend on another test having run first. */
 const { buildEpub } = await import(pathToFileURL(path.join(ROOT, 'src', 'epub', 'build.js')).href)
@@ -289,6 +354,9 @@ await writeFile(foreignEpub, buildEpub({
   identifier: 'urn:uuid:00000000-0000-4000-8000-0000000000ff',
   chapters: [{ title: '唯一章', html: '<h1>唯一章</h1><p>正文。</p>' }],
 }))
+
+/** Id of the first job the suite starts: the oldest record, and the first one the cap evicts. */
+let firstJobId = ''
 
 try {
   /* The registry, not the filesystem, decides: these files exist but no job
@@ -383,11 +451,11 @@ try {
   const plainRoutes = []
   const plainCtx = { ...ctx, webServer: { register(route) { plainRoutes.push(route); return () => {} } } }
   serverModule.registerRoutes(plainCtx, { primaryModel: '' })
-  const jobsBefore = started.size
+  const jobsBefore = serverModule.stateCount()
   const unconfigured = await invoke(plainRoutes.find(route => route.path === RUN), trusted(RUN, JSON.stringify({ input: '.out/whatever.pdf' })))
   assert.equal(unconfigured.status, 400)
   assert.match(JSON.parse(unconfigured.body).error, /primaryModel is not configured/)
-  assert.equal(started.size, jobsBefore, 'an unconfigured plugin must not start a job')
+  assert.equal(serverModule.stateCount(), jobsBefore, 'an unconfigured plugin must not start a job')
   ok('20 POST /run on an unconfigured plugin -> 400 naming the setting', unconfigured.body)
 
   await assert.rejects(
@@ -396,7 +464,6 @@ try {
   )
   ok('21 the tool path refuses the same way before touching the pipeline')
 
-  /* Job: a missing PDF must fail the conversion, not the process. */
   const emptyPost = await invoke(routeOf(RUN), trusted(RUN, ''))
   assert.equal(emptyPost.status, 400)
   ok('22 POST /run with an empty body -> 400', `${emptyPost.status} ${emptyPost.body}`)
@@ -406,42 +473,278 @@ try {
   assert.match(JSON.parse(badSpec.body).error, /"input"/)
   ok('23 POST /run without input -> 400 naming the field', badSpec.body)
 
-  const accepted = await invoke(routeOf(RUN), trusted(RUN, JSON.stringify({ input: '.out/does-not-exist.pdf' })))
-  assert.equal(accepted.status, 200)
-  const jobId = JSON.parse(accepted.body).jobId
-  assert.equal(typeof jobId, 'string')
-  ok('24 POST /run returns { jobId }', accepted.body)
-
-  const hooks = started.get(jobId).hooks
-  const outcome = await hooks.done
-  assert.equal(outcome.status, 'failed', `job outcome was ${outcome.status}`)
-  assert.ok(typeof outcome.detail === 'string' && outcome.detail !== '', 'failure must carry a message')
-  ok('25 a failing conversion is captured, process stays up', `done -> ${outcome.status}: ${outcome.detail}`)
-
-  const stateAfter = await invoke(routeOf(STATE), trusted(`${STATE}?jobId=${encodeURIComponent(jobId)}`))
-  assert.equal(stateAfter.status, 200)
-  const stateBody = JSON.parse(stateAfter.body)
-  assert.equal(stateBody.phase, 'failed')
-  assert.equal(stateBody.status, 'failed')
-  assert.deepEqual(stateBody.tokens, { input: null, output: null, total: 0 })
-  assert.equal(stateBody.error, outcome.detail)
-  ok('26 GET /state reports the failure with its message', JSON.stringify({
-    phase: stateBody.phase,
-    status: stateBody.status,
-    error: stateBody.error,
+  /* The six options added to the tool contract must reach the pipeline through
+   * `POST /run` as well: `parseSpec()` used to whitelist only the old fields, so
+   * a page selection, a cover request and a metadata override vanished silently
+   * on the panel path. The injected runner captures the spec it is handed. */
+  let optionSpec
+  serverModule.setConversionRunner(async (runnerCtx, runnerConfig, runnerSpec) => {
+    optionSpec = runnerSpec
+    return {
+      ok: true,
+      epubPath: jobEpub,
+      reportPath: jobReport,
+      bookJsonPath: jobBook,
+      pages: 2,
+      chapters: 1,
+      tokens: { input: 0, output: 0, total: 0 },
+      degradedPages: 0,
+    }
+  })
+  const optionRun = await invoke(routeOf(RUN), trusted(RUN, JSON.stringify({ input: '.out/options.pdf', pages: '1-2', cover: true, title: 'T' })))
+  assert.equal(optionRun.status, 200, `POST /run answered ${optionRun.status}: ${optionRun.body}`)
+  await settled(JSON.parse(optionRun.body).jobId)
+  serverModule.setConversionRunner(null)
+  assert.ok(optionSpec !== undefined, 'the injected runner must be reached')
+  assert.equal(optionSpec.pages, '1-2')
+  assert.equal(optionSpec.cover, true)
+  assert.equal(optionSpec.title, 'T')
+  for (const key of ['excludePages', 'author', 'publisher']) {
+    assert.equal(Object.hasOwn(optionSpec, key), false, `an unsupplied "${key}" must not be added to the spec`)
+  }
+  ok('23b POST /run hands "pages", "cover" and "title" to the pipeline spec', JSON.stringify({
+    pages: optionSpec.pages,
+    cover: optionSpec.cover,
+    title: optionSpec.title,
+    unsuppliedKeysAdded: ['excludePages', 'author', 'publisher'].filter(key => Object.hasOwn(optionSpec, key)),
   }))
+
+  /* ------------------------------------------------------------------------ */
+  /* The executor: no job controller, a module-owned state table              */
+  /* ------------------------------------------------------------------------ */
+
+  /* 24-26 drive the executor through the `setConversionRunner` seam: the fake
+   * holds the run open at two gates, so the "accepted, still running" record and
+   * the progress events are observed deterministically instead of by racing a
+   * real conversion to completion. */
+  let releaseStarted
+  const startedGate = new Promise((resolve) => { releaseStarted = resolve })
+  let releaseFinished
+  const finishedGate = new Promise((resolve) => { releaseFinished = resolve })
+  const runnerCalls = []
+
+  serverModule.setConversionRunner(async (runnerCtx, runnerConfig, runnerSpec, options) => {
+    runnerCalls.push({ ctx: runnerCtx, config: runnerConfig, spec: runnerSpec })
+    await startedGate
+    options.onProgress({ phase: 'start', pages: 2, input: runnerSpec.input })
+    options.onProgress({ phase: 'page', page: 1, total: 2, status: 'ok', tokens: 26 })
+    await finishedGate
+    options.onProgress({ phase: 'page', page: 2, total: 2, status: 'degraded', tokens: 45 })
+    options.onProgress({ phase: 'assemble', pages: 2 })
+    options.onProgress({ phase: 'done', epubPath: jobEpub, reportPath: jobReport, tokens: 45 })
+    return {
+      ok: true,
+      epubPath: jobEpub,
+      reportPath: jobReport,
+      bookJsonPath: jobBook,
+      pages: 2,
+      chapters: 2,
+      tokens: { input: 100, output: 50, total: 150 },
+      degradedPages: 1,
+    }
+  })
+
+  /* The explicit contract: `POST /run` answers 200 + jobId on a context with no
+   * `jobs` field at all (this one), and the state table has the record at once. */
+  const accepted = await invoke(routeOf(RUN), trusted(RUN, JSON.stringify({ input: '.out/injected-success.pdf', dpi: 150 })))
+  assert.equal(accepted.status, 200, `POST /run answered ${accepted.status}: ${accepted.body}`)
+  const jobId = JSON.parse(accepted.body).jobId
+  firstJobId = jobId
+  assert.match(jobId, /^pdf2epub-/, 'the id is minted by this module')
+  const queued = serverModule.readJobState(jobId)
+  assert.ok(queued !== undefined, 'the state table must hold the record as soon as /run answers')
+  assert.equal(queued.phase, 'queued')
+  assert.equal(queued.status, 'running')
+  assert.equal(typeof queued.createdAt, 'number')
+  assert.equal(queued.error, null)
+  ok('24 POST /run on a ctx with no "jobs" -> 200 { jobId }, record queued/running at once', accepted.body)
+
+  releaseStarted()
+  const onPage = await untilState(jobId, state => state.page === 1)
+  assert.equal(onPage.phase, 'page')
+  assert.equal(onPage.page, 1)
+  assert.equal(onPage.total, 2)
+  assert.equal(onPage.status, 'running', 'a page verdict must not replace the job lifecycle status')
+  assert.equal(onPage.pageStatus, 'ok')
+  assert.equal(onPage.tokens.total, 26)
+  assert.equal(runnerCalls.length, 1)
+  assert.equal(runnerCalls[0].spec.input, '.out/injected-success.pdf')
+  assert.equal(runnerCalls[0].ctx, ctx, 'the executor hands the plugin context through')
+  ok('25 progress events land in the record', JSON.stringify({ phase: onPage.phase, page: onPage.page, total: onPage.total, pageStatus: onPage.pageStatus, tokens: onPage.tokens }))
+
+  releaseFinished()
+  const completed = await settled(jobId)
+  assert.ok(completed !== undefined, 'the record must survive settlement')
+  assert.equal(completed.phase, 'done')
+  assert.equal(completed.status, 'completed')
+  assert.equal(completed.page, 2)
+  assert.equal(completed.total, 2)
+  assert.equal(completed.epubPath, jobEpub)
+  assert.equal(completed.reportPath, jobReport)
+  assert.equal(completed.bookJsonPath, jobBook)
+  assert.deepEqual(completed.tokens, { input: 100, output: 50, total: 150 })
+  assert.equal(completed.error, null)
+  ok('26 a successful run settles done/completed with its three paths', JSON.stringify({
+    phase: completed.phase,
+    status: completed.status,
+    epubPath: completed.epubPath,
+    tokens: completed.tokens,
+  }))
+
+  /* recordArtifacts ran as part of that settlement: the two readers must serve
+   * the files without any further call. */
+  const jobFile = await invoke(routeOf(FILE), trusted(`${FILE}?path=${enc(jobEpub)}`))
+  assert.equal(jobFile.status, 200)
+  assert.equal(jobFile.type, 'application/epub+zip')
+  assert.equal(jobFile.body, JOB_EPUB_BYTES.toString('utf8'))
+  const jobSidecar = await invoke(routeOf(BOOK), trusted(`${BOOK}?path=${enc(jobBook)}`))
+  assert.equal(jobSidecar.status, 200)
+  assert.equal(JSON.parse(jobSidecar.body).schema, 'job-book')
+  const reportSidecar = await invoke(routeOf(FILE), trusted(`${FILE}?path=${enc(jobReport)}`))
+  assert.equal(reportSidecar.status, 200)
+  ok('26b a settled success registers its artifacts for GET /file and GET /book', `${jobFile.status}/+book ${jobSidecar.status}/+report ${reportSidecar.status}`)
+
+  /* Back to the real runner: a missing PDF must fail the job, with a readable
+   * message and no artifacts registered — and the process must stay up. */
+  serverModule.setConversionRunner(null)
+  const failing = await invoke(routeOf(RUN), trusted(RUN, JSON.stringify({ input: '.out/does-not-exist.pdf' })))
+  assert.equal(failing.status, 200)
+  const failId = JSON.parse(failing.body).jobId
+  const failState = await settled(failId)
+  assert.ok(failState !== undefined)
+  assert.equal(failState.phase, 'failed')
+  assert.equal(failState.status, 'failed')
+  assert.match(failState.error, /PDF not found/)
+  assert.equal(failState.epubPath, null)
+  assert.equal(failState.reportPath, null)
+  assert.equal(failState.bookJsonPath, null)
+  ok('27 the real executor turns a failed conversion into a failed record, process stays up', `${failState.phase}/${failState.status}: ${failState.error}`)
+
+  const failRead = await invoke(routeOf(STATE), trusted(`${STATE}?jobId=${encodeURIComponent(failId)}`))
+  assert.equal(failRead.status, 200)
+  const failBody = JSON.parse(failRead.body)
+  assert.equal(failBody.phase, 'failed')
+  assert.equal(failBody.status, 'failed')
+  assert.equal(failBody.error, failState.error)
+  assert.deepEqual(failBody.tokens, { input: null, output: null, total: 0 })
+  ok('27b GET /state reports the failure with its message', JSON.stringify({ phase: failBody.phase, status: failBody.status, error: failBody.error }))
 
   const secondRun = await invoke(routeOf(RUN), trusted(RUN, JSON.stringify({ input: '.out/does-not-exist-2.pdf', outputDir: '.out' })))
   const secondId = JSON.parse(secondRun.body).jobId
   assert.notEqual(secondId, jobId, 'job ids must be isolated')
-  await started.get(secondId).hooks.done
-  const firstState = JSON.parse((await invoke(routeOf(STATE), trusted(`${STATE}?jobId=${encodeURIComponent(jobId)}`))).body)
-  const secondState = JSON.parse((await invoke(routeOf(STATE), trusted(`${STATE}?jobId=${encodeURIComponent(secondId)}`))).body)
-  assert.equal(firstState.jobId, jobId)
+  const firstState = await settled(jobId)
+  const secondState = await settled(secondId)
+  assert.equal(firstState.jobId, firstJobId)
   assert.equal(secondState.jobId, secondId)
-  assert.equal(firstState.status, 'failed')
   assert.equal(secondState.status, 'failed')
-  ok('27 concurrent job state stays isolated per jobId', `${firstState.jobId} / ${secondState.jobId}`)
+  assert.equal(firstState.status, 'completed', 'a later job must not touch an earlier record')
+  ok('28 concurrent job state stays isolated per jobId', `${firstState.jobId} / ${secondState.jobId}`)
+
+  /* `startConversionJob` itself, on a context with nothing injected at all: the
+   * call that used to throw "no job controller serves this agent". */
+  const orphan = serverModule.startConversionJob({}, CONFIG, { input: path.join(OUT, 'orphan.pdf') })
+  assert.equal(typeof orphan.jobId, 'string')
+  assert.match(orphan.jobId, /^pdf2epub-/)
+  const orphanState = await settled(orphan.jobId)
+  assert.ok(orphanState !== undefined)
+  assert.equal(orphanState.phase, 'failed')
+  assert.match(orphanState.error, /PDF not found/)
+  ok('29 startConversionJob never needs a job controller', `{} -> ${orphanState.phase}: ${orphanState.error}`)
+
+  /* The exact production symptom: a context that DOES carry a `jobs` service,
+   * but no controller for this agent. `ctx.jobs.start` used to be called and threw
+   * "no job controller serves this agent", which the route turned into a 500. A
+   * run must now succeed without ever touching that service. */
+  let legacyTouched = 0
+  const legacyRoutes = []
+  const legacyCtx = {
+    llm: {},
+    attachments: {},
+    connection: { requestRejection },
+    jobs: {
+      start() {
+        legacyTouched += 1
+        throw new Error('background jobs unavailable: no job controller serves this agent')
+      },
+    },
+    webServer: {
+      register(route) {
+        legacyRoutes.push(route)
+        return () => {}
+      },
+    },
+    effect(callback) {
+      const disposer = callback()
+      return () => {
+        if (typeof disposer === 'function') disposer()
+      }
+    },
+  }
+  serverModule.registerRoutes(legacyCtx, CONFIG)
+  const legacyRun = await invoke(legacyRoutes.find(route => route.path === RUN), trusted(RUN, JSON.stringify({ input: '.out/controllerless.pdf' })))
+  assert.equal(legacyRun.status, 200, `POST /run answered ${legacyRun.status}: ${legacyRun.body}`)
+  const legacyId = JSON.parse(legacyRun.body).jobId
+  assert.match(legacyId, /^pdf2epub-/)
+  const legacyState = await settled(legacyId)
+  assert.equal(legacyState.phase, 'failed')
+  assert.equal(legacyTouched, 0, 'ctx.jobs.start must not be called any more')
+  ok('29b a "no job controller" jobs service is never reached; /run still answers 200', `${legacyRun.body} -> ${legacyState.phase}, jobs.start touched ${legacyTouched}x`)
+
+  /* ------------------------------------------------------------------------ */
+  /* State table cap (review finding S5)                                      */
+  /* ------------------------------------------------------------------------ */
+
+  /* One held run plus a flood of quick failures: the flood pushes the table past
+   * the cap, the oldest settled records must fall out, and the record that is
+   * still running must survive. */
+  let releaseHeld
+  const heldGate = new Promise((resolve) => { releaseHeld = resolve })
+  serverModule.setConversionRunner(async () => {
+    await heldGate
+    return {
+      ok: true,
+      epubPath: jobEpub,
+      reportPath: jobReport,
+      bookJsonPath: jobBook,
+      pages: 1,
+      chapters: 1,
+      tokens: { input: 1, output: 1, total: 2 },
+      degradedPages: 0,
+    }
+  })
+  const heldRun = await invoke(routeOf(RUN), trusted(RUN, JSON.stringify({ input: '.out/held.pdf' })))
+  assert.equal(heldRun.status, 200)
+  const heldId = JSON.parse(heldRun.body).jobId
+  assert.equal(serverModule.readJobState(heldId).status, 'running')
+  /* The held call already captured its runner; the rest of the flood uses the
+   * real one, so each of them settles on the spot. */
+  serverModule.setConversionRunner(null)
+
+  const floodIds = []
+  for (let index = 0; index < 59; index += 1) {
+    const flood = await invoke(routeOf(RUN), trusted(RUN, JSON.stringify({ input: `.out/cap-job-${index}.pdf` })))
+    assert.equal(flood.status, 200, `flood job ${index} answered ${flood.status}: ${flood.body}`)
+    floodIds.push(JSON.parse(flood.body).jobId)
+  }
+  assert.equal(new Set(floodIds).size, floodIds.length, 'every job id must be unique')
+  await Promise.all(floodIds.map(id => settled(id)))
+  await delay(20)
+
+  assert.ok(serverModule.stateCount() <= MAX_STATES, `state table holds ${serverModule.stateCount()} records, cap is ${MAX_STATES}`)
+  const heldState = serverModule.readJobState(heldId)
+  assert.ok(heldState !== undefined, 'a running record must never be evicted')
+  assert.equal(heldState.status, 'running')
+  assert.equal(serverModule.readJobState(firstJobId), undefined, 'the oldest settled record must be the first to go')
+  const evictedRead = await invoke(routeOf(STATE), trusted(`${STATE}?jobId=${encodeURIComponent(firstJobId)}`))
+  assert.equal(evictedRead.status, 404)
+  ok('30 the job table stays capped at 50, dropping the oldest settled record and keeping a running one', `size ${serverModule.stateCount()}, oldest -> 404`)
+
+  releaseHeld()
+  const heldDone = await settled(heldId)
+  assert.equal(heldDone.phase, 'done')
+  assert.equal(heldDone.status, 'completed')
+  assert.ok(serverModule.stateCount() <= MAX_STATES, `state table grew to ${serverModule.stateCount()} after the held job settled`)
+  ok('30b the held job still completes after the eviction round', `${heldDone.phase}/${heldDone.status}, size ${serverModule.stateCount()}`)
 
   /* Registry cap: 200 entries, the oldest fall out first. */
   serverModule.recordArtifacts('pdf2epub-test-cap-seed', { epubPath: '', reportPath: '', bookJsonPath: bookFixture })
@@ -455,8 +758,9 @@ try {
   }
   const evicted = await invoke(routeOf(BOOK), trusted(`${BOOK}?path=${enc(bookFixture)}`))
   assert.equal(evicted.status, 404)
-  ok('28 artifact registry stays capped, dropping the oldest entry', `${evicted.status} ${evicted.body}`)
+  ok('31 artifact registry stays capped, dropping the oldest entry', `${evicted.status} ${evicted.body}`)
 } finally {
+  serverModule.setConversionRunner(null)
   await unlink(bookFixture).catch(() => {})
   await unlink(reportFixture).catch(() => {})
   await unlink(epubFixture).catch(() => {})
@@ -464,6 +768,9 @@ try {
   await unlink(toolEpub).catch(() => {})
   await unlink(toolReport).catch(() => {})
   await unlink(toolBook).catch(() => {})
+  await unlink(jobEpub).catch(() => {})
+  await unlink(jobReport).catch(() => {})
+  await unlink(jobBook).catch(() => {})
 }
 
 /* Config keys the host will validate (from the schema in index.js). */

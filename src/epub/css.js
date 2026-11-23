@@ -181,6 +181,66 @@ caption {
   text-align: left;
 }
 
+/* An address block (imprint, publisher's line): centred and tight, because the
+   lines belong together and the model already broke them at the right spots. */
+.address {
+  margin: 0.8em 0;
+  text-indent: 0;
+  text-align: center;
+  line-height: 1.4;
+}
+
+.code {
+  margin: 0.8em 0;
+  white-space: pre-wrap;
+  text-indent: 0;
+  text-align: left;
+  font-family: "SFMono-Regular", "Consolas", "Menlo", monospace;
+  font-size: 0.9em;
+}
+
+/* ---------- table of contents ---------- *
+ * A "toc" block is rendered as a real nav list: one li per printed entry, the
+ * depth carried by .toc-N, and the printed page number pushed to the right on
+ * the same line (display: flex aligns the two ends without a leader made of
+ * dots, which a reflowable layout could not align anyway). */
+.toc {
+  margin: 1.2em 0;
+  text-indent: 0;
+}
+
+.toc ol {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.toc li {
+  display: flex;
+  align-items: baseline;
+  margin: 0.15em 0;
+  text-indent: 0;
+}
+
+.toc-1 { padding-left: 0; }
+.toc-2 { padding-left: 1.6em; }
+.toc-3 { padding-left: 3.2em; }
+.toc-4 { padding-left: 4.8em; }
+.toc-5 { padding-left: 6.4em; }
+.toc-6 { padding-left: 8em; }
+
+.toc-title {
+  flex: 1 1 auto;
+  text-align: left;
+}
+
+.toc-page {
+  flex: 0 0 auto;
+  padding-left: 0.6em;
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
 .quote,
 .blockquote {
   margin: 1em 2em;

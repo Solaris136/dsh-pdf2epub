@@ -31,7 +31,7 @@
   "scripts": {
     "pretest": "node src/pdf/smoke.mjs",
     "test": "node src/model/test.mjs && node src/epub/test.mjs && node src/epub/hardening.test.mjs && node test/e2e.mjs",
-    "test:harness": "node test/harness/host-check.mjs && node test/harness/epub-route-check.mjs && node test/harness/client-check.mjs && node test/harness/locale-check.mjs && node test/harness/preview-check.mjs && node test/harness/route-path.mjs && node test/harness/security-check.mjs"
+    "test:harness": "node test/harness/host-check.mjs && node test/harness/epub-route-check.mjs && node test/harness/client-check.mjs && node test/harness/locale-check.mjs && node test/harness/preview-check.mjs && node test/harness/route-path.mjs && node test/harness/security-check.mjs && node test/harness/model-select-check.mjs && node test/harness/picker-check.mjs"
   },
   "dsh": {
     "bundle": {

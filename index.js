@@ -23,7 +23,7 @@ export const name = 'dsh-pdf2epub'
  * `connection` is the request fence every route uses.
  * @type {string[]}
  */
-export const inject = ['llm', 'attachments', 'jobs', 'tools', 'webServer', 'connection']
+export const inject = ['llm', 'attachments', 'tools', 'webServer', 'connection']
 
 /** Values used when the host resolves no configuration at all. */
 const CONFIG_DEFAULTS = Object.freeze({
@@ -159,6 +159,8 @@ function definePdf2epubTool(ctx, settings) {
       'Convert a whole PDF into a reflowable EPUB 3, fully automatically: every page is rendered and transcribed by a vision model, the pipeline\'s page sentinels never block on a bad page, weak pages are cross-reviewed by the configured extra models, and the result is assembled into chapters.',
       'Writes three files next to each other in the output directory: <book>.epub, <book>.report.json (per-page quality, models used, token ledger) and <book>.book.json (the chapter list a reading view renders without unpacking the EPUB).',
       'Returns canonical JSON with the three output paths, page and chapter counts, token usage and the number of degraded pages. Pages are cached on disk, so re-running after an interruption resumes instead of starting over; pass force to ignore the cache.',
+      'A big book can be converted in batches with pages ("1-5,31-35,73") and excludePages: only the selected pages are rendered and sent to a model, and the per-page cache stays keyed by the whole book, so later batches and the final whole-book run reuse every page already transcribed. Never copy or rename the PDF to split it - that changes the cache identity and throws the whole cache away.',
+      'cover renders page 1 as the EPUB cover image; title, author and publisher override the PDF metadata on the book itself (the caller\'s value wins over the PDF\'s, and the PDF\'s over the file name).',
       'The primary model must accept image input. A long book takes minutes and the call returns only when the EPUB is written; for big documents the panel starts the same conversion as a background job instead.',
     ].join(' '),
     parameters: {
@@ -198,6 +200,30 @@ function definePdf2epubTool(ctx, settings) {
         splitLevel: {
           type: 'number',
           description: 'Heading level that starts a new chapter, 1-6.',
+        },
+        pages: {
+          type: 'string',
+          description: 'Pages to convert, as "1-5,31-35,73" (1-based, comma separated, ranges inclusive). Omit to convert the whole document. Pages outside the selection are neither rendered nor sent to a model and do not enter the EPUB; the page cache stays keyed by the whole book plus the page number, so several batches and the final whole-book run share every page already transcribed.',
+        },
+        excludePages: {
+          type: 'string',
+          description: 'Pages to leave out of the run, same syntax as pages. Applied after pages: "pages: 1-3" with "excludePages: 2" converts pages 1 and 3. Useful for a scan that ends with a library or archive cover sheet.',
+        },
+        cover: {
+          type: 'boolean',
+          description: 'Render page 1 as the EPUB cover image (PNG, long edge 1400px) and declare it as the package cover. Off by default. Page 1 is still transcribed only if the page selection includes it, and a render failure is recorded as a warning instead of failing the book.',
+        },
+        title: {
+          type: 'string',
+          description: 'Book title for the EPUB metadata. Wins over the PDF\'s own title, which wins over the file name.',
+        },
+        author: {
+          type: 'string',
+          description: 'Book author (dc:creator) for the EPUB metadata. Wins over the PDF\'s own author metadata.',
+        },
+        publisher: {
+          type: 'string',
+          description: 'Publisher (dc:publisher) for the EPUB metadata. A PDF carries no publisher field, so without this the OPF simply has none.',
         },
         force: {
           type: 'boolean',
@@ -241,13 +267,22 @@ function definePdf2epubTool(ctx, settings) {
      * readers must still be able to open what it wrote.
      *
      * @param {unknown} args - parsed model arguments; validated by {@link parseSpec}.
-     * @param {{ signal?: AbortSignal }} exec - execution identity; the signal is forwarded so a cancelled call stops the pages in flight.
+     * @param {{ signal?: AbortSignal, agent?: { id?: unknown } }} exec - execution identity; the signal is forwarded so a cancelled call stops the pages in flight, and the agent's Session id becomes the model route's per-session routing id.
      * @returns {Promise<object>} canonical value declared by `output.schema`.
      */
     async execute(args, exec) {
-      const spec = parseSpec(args)
+      const spec = extendSpec(parseSpec(args), args)
+      // The adapter derives a required per-session routing header from
+      // `GenerateOptions.sessionId` (opencode-go answers `400 MissingSessionID`
+      // without it), and the Agent that called this tool *is* the session the
+      // work belongs to, so its id is forwarded when the runtime supplied one.
+      // The other surfaces - the panel's job, a direct `runConversion()` - hold
+      // no Agent, and the pipeline then uses its own per-book derived id instead
+      // of inventing a second one here.
+      const sessionId = agentSessionId(exec)
+      const request = sessionId === undefined ? spec : { ...spec, sessionId }
       try {
-        const canonical = await convertToCanonical(ctx, settings, spec, { signal: exec?.signal })
+        const canonical = await convertToCanonical(ctx, settings, request, { signal: exec?.signal })
         recordArtifacts('tool', canonical)
         return canonical
       } catch (error) {
@@ -257,6 +292,67 @@ function definePdf2epubTool(ctx, settings) {
     },
     presentCall: args => ({ card: 'generic', title: 'pdf2epub', rawInput: args }),
   }
+}
+
+/**
+ * Options this tool declares on top of the request shape `parseSpec()` owns.
+ *
+ * `parseSpec()` is the request contract the panel and the tool share, so it only
+ * copies the fields both surfaces understand. These six exist for the tool (and
+ * for any direct `runConversion()` caller that builds its own spec): they are
+ * type checked here, because a boolean where a page expression belongs must fail
+ * before a conversion starts, while their *meaning* is validated by the pipeline -
+ * the only layer that knows how many pages the document really has.
+ *
+ * @type {string[]}
+ */
+const TOOL_STRING_OPTIONS = ['pages', 'excludePages', 'title', 'author', 'publisher']
+
+/**
+ * Fold the tool's own options into a `parseSpec()` result.
+ *
+ * Keys the caller did not supply are left absent, exactly as `parseSpec()` does,
+ * so the pipeline's own defaults stay in charge.
+ *
+ * @param {object} spec - spec returned by `parseSpec()`.
+ * @param {Record<string, unknown>} args - parsed model arguments.
+ * @returns {object} the spec with the tool's options added.
+ * @throws {Error} when an option has the wrong type.
+ */
+function extendSpec(spec, args) {
+  /** @type {Record<string, unknown>} */
+  const extended = { ...spec }
+  for (const key of TOOL_STRING_OPTIONS) {
+    const value = args[key]
+    if (value === undefined) continue
+    if (typeof value !== 'string') {
+      throw new Error(`pdf2epub: "${key}" must be a string${key === 'pages' || key === 'excludePages' ? ' such as "1-5,31-35,73"' : ''}`)
+    }
+    extended[key] = value
+  }
+  if (args.cover !== undefined) {
+    if (typeof args.cover !== 'boolean') throw new Error('pdf2epub: "cover" must be a boolean')
+    extended.cover = args.cover
+  }
+  return extended
+}
+
+/**
+ * The calling Agent's Session id, when the tool runtime exposes one.
+ *
+ * `ToolRunContext.agent` is optional (`@deepseek-ai/dsh-tools`: "set by the agent
+ * loop"), and `Agent.id` is the Session id itself - a `SessionId` is a branded
+ * STRING, so the value is read from `agent.id` and not from something like
+ * `agent.session.id`. Anything unusable (no agent, an empty id, a non-string)
+ * yields `undefined`, which leaves the pipeline to derive `<book>`'s own stable
+ * id: a wrong or empty header would be rejected exactly like a missing one.
+ *
+ * @param {{ agent?: { id?: unknown } } | null | undefined} exec - the tool execution context.
+ * @returns {string | undefined} session routing id, or undefined when none is available.
+ */
+function agentSessionId(exec) {
+  const id = exec?.agent?.id
+  return typeof id === 'string' && id !== '' ? id : undefined
 }
 
 /**

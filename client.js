@@ -26,6 +26,19 @@
  * Self-contained by design: only the platform module table is required (here
  * `react` alone), no relative imports, and no second React root — the slot
  * renderer owns the tree, this file only supplies components.
+ *
+ * 「浏览…」 picks the PDF instead of typing it, and there is no Host route behind
+ * it, because no such surface exists: the Host process runs in Electron's Node
+ * mode (`dsh-desktop-host` is spawned with `ELECTRON_RUN_AS_NODE=1`), so it has
+ * no `dialog` module, and `ctx.directoryPicker` serves **folders** — one
+ * capability per boot, `pick` (OS folder chooser) or `list` (folder-only
+ * levels), never files. Two mechanisms are therefore used, in order:
+ *   1. the Desktop preload's `__DSH_HOST_PATHS__.pathFor(file)` bridge driven by
+ *      an `<input type="file" accept=".pdf">`: the real OS "Open" dialog, with a
+ *      PDF filter, returning the absolute host path. Desktop windows only.
+ *   2. `ctx.remote.directoryPicker.list(path)`: an in-app browser overlay for
+ *      every other deployment (a plain browser tab can never read a path off a
+ *      `File`, so this is the only fallback there is).
  */
 
 const PANEL_ID = 'pdf2epub'
@@ -41,6 +54,15 @@ const POLL_MS = 1000
 
 /** Phases after which the Host will not change the job again. */
 const TERMINAL_PHASES = new Set(['done', 'failed'])
+
+/**
+ * Suffix a browsed entry must carry to be offered as a PDF, matched
+ * case-insensitively (`.PDF` is the same file as `.pdf` on both platforms).
+ */
+const PDF_SUFFIX_RE = /\.pdf$/i
+
+/** `accept` value of the file input the Desktop chooser opens behind. */
+const PDF_ACCEPT = 'application/pdf,.pdf'
 
 /**
  * Pipeline phases (`src/host/server.js`) mapped onto the shipped `status.*`
@@ -1309,6 +1331,446 @@ function clientService(ctx, name) {
   }
 }
 
+/* ------------------------------------------------- choosing a local file */
+
+/**
+ * The Desktop preload's file-path bridge, when this page is the Desktop app.
+ *
+ * `preload-app.cjs` exposes `__DSH_HOST_PATHS__` to `dsh-app://app` pages and
+ * nothing else, so a plain browser tab never has it. It is the only surface in
+ * the whole application that turns a picked `File` back into an **absolute host
+ * path** (`electron.webUtils.getPathForFile`, which replaced the removed
+ * `File.path`); a page cannot read a path off a `File` by itself, by design.
+ *
+ * @returns {{ pathFor: (file: unknown) => string } | null} the bridge, or `null` outside Desktop.
+ */
+function desktopPathBridge() {
+  if (typeof window !== 'object' || window === null) return null
+  let bridge
+  try {
+    bridge = window.__DSH_HOST_PATHS__
+  } catch {
+    // A locked-down window may refuse the property read.
+    return null
+  }
+  if (bridge === null || typeof bridge !== 'object') return null
+  return typeof bridge.pathFor === 'function' ? bridge : null
+}
+
+/**
+ * Open the operating system's file chooser and resolve the chosen PDF's path.
+ *
+ * The chooser is the browser's own: an `<input type="file">` clicked inside the
+ * user's gesture makes Chromium show the platform "Open" dialog with the
+ * `accept` filter applied, which is exactly the native picker with a `.pdf`
+ * filter that a Web page is allowed to have. The preload bridge then maps the
+ * selected `File` onto its absolute path.
+ *
+ * Cancellation is not an error: Chromium fires `cancel` on the input (and, on
+ * older builds, nothing at all — the promise then simply stays pending until
+ * the input is used again). A reported cancel resolves `{ ok: false }` so the
+ * caller leaves the typed path untouched.
+ *
+ * @param {{ pathFor: (file: unknown) => string }} bridge - the Desktop path bridge.
+ * @param {object | null} mount - element the input is attached to, if any.
+ * @returns {Promise<{ ok: true, path: string } | { ok: false, reason: 'cancelled' | 'unavailable' }> | null} the outcome, or `null` when no chooser can be built.
+ */
+function choosePdfWithDesktopBridge(bridge, mount) {
+  if (typeof document !== 'object' || document === null) return null
+  if (typeof document.createElement !== 'function') return null
+  let input
+  try {
+    input = document.createElement('input')
+  } catch {
+    return null
+  }
+  if (input === null || typeof input !== 'object') return null
+
+  return new Promise((resolve) => {
+    let settled = false
+    /** Report one outcome once, removing the input and its listeners. */
+    const finish = (outcome) => {
+      if (settled) return
+      settled = true
+      detachListener(input, 'change', onChange)
+      detachListener(input, 'cancel', onCancel)
+      const parent = input.parentNode
+      if (parent !== null && parent !== undefined && typeof parent.removeChild === 'function') {
+        try {
+          parent.removeChild(input)
+        } catch {
+          // Already detached: nothing left to clean up.
+        }
+      }
+      resolve(outcome)
+    }
+    const onChange = () => {
+      const files = input.files
+      const file = files !== null && files !== undefined && files.length > 0 ? files[0] : null
+      if (file === null || file === undefined) {
+        finish({ ok: false, reason: 'cancelled' })
+        return
+      }
+      let absolute = ''
+      try {
+        absolute = bridge.pathFor(file)
+      } catch {
+        absolute = ''
+      }
+      // `getPathForFile` answers '' for a value it cannot map: the caller then
+      // falls back to the in-app picker instead of storing a broken path.
+      finish(typeof absolute === 'string' && absolute !== '' ? { ok: true, path: absolute } : { ok: false, reason: 'unavailable' })
+    }
+    const onCancel = () => finish({ ok: false, reason: 'cancelled' })
+
+    input.type = 'file'
+    input.accept = PDF_ACCEPT
+    input.multiple = false
+    if (input.style !== null && typeof input.style === 'object') input.style.display = 'none'
+    if (typeof input.addEventListener === 'function') {
+      input.addEventListener('change', onChange)
+      input.addEventListener('cancel', onCancel)
+    }
+    if (mount !== null && mount !== undefined && typeof mount.appendChild === 'function') {
+      try {
+        mount.appendChild(input)
+      } catch {
+        // A detached input still opens the chooser in Chromium.
+      }
+    }
+    if (typeof input.click === 'function') input.click()
+    else finish({ ok: false, reason: 'unavailable' })
+  })
+}
+
+/** Remove one listener from a node that may be a stub. */
+function detachListener(node, type, listener) {
+  if (node === null || node === undefined || typeof node.removeEventListener !== 'function') return
+  try {
+    node.removeEventListener(type, listener)
+  } catch {
+    // Nothing to detach from.
+  }
+}
+
+/**
+ * The Client `directoryPicker` Remote namespace, when this page has it.
+ *
+ * A hand-written client reaches it as a plain service: `ctx.remote` is mounted
+ * by the API assembly, and the namespace's two verbs are mutually exclusive by
+ * construction — the Host composes **one** backend, and
+ * `DirectoryPickerController.requireCapability` refuses the verb the other kind
+ * owns (`directory-picker/unavailable`). A Desktop Host resolves `native`
+ * (`pick`), a remote one `browse` (`list`).
+ *
+ * @param {object} ctx - Cordis client context.
+ * @returns {{ list: Function } | null} the namespace, or `null` when absent.
+ */
+function directoryPickerRemote(ctx) {
+  const remote = clientService(ctx, 'remote')
+  if (remote === null || typeof remote !== 'object') return null
+  let picker
+  try {
+    picker = remote.directoryPicker
+  } catch {
+    return null
+  }
+  if (picker === null || typeof picker !== 'object') return null
+  return typeof picker.list === 'function' ? picker : null
+}
+
+/**
+ * Unwrap one Remote answer.
+ *
+ * Generated Remote methods resolve `RemoteResult` (`{ ok, value }` /
+ * `{ ok, error }`) instead of rejecting, so a refusal has to be raised here
+ * before the value is read.
+ *
+ * @param {unknown} result - what the Remote call resolved.
+ * @param {string} fallback - message for a refusal that carries none.
+ * @returns {unknown} the success value.
+ * @throws {Error & { code?: string }} when the Host refused the call.
+ */
+function remoteValue(result, fallback) {
+  if (result === null || typeof result !== 'object') return result
+  if (typeof result.ok !== 'boolean') return result
+  if (result.ok === true) return result.value
+  const failure = result.error
+  const described = failure !== null && typeof failure === 'object' && typeof failure.message === 'string'
+    ? failure.message
+    : ''
+  const error = new Error(described === '' ? fallback : described)
+  if (failure !== null && typeof failure === 'object' && typeof failure.code === 'string') error.code = failure.code
+  throw error
+}
+
+/* ------------------------------------------------------ model catalogue */
+
+/**
+ * Sentinel value of the 「自定义…」 row.
+ *
+ * A legal route always contains a slash (`parseRoute` rejects anything else,
+ * `src/host/bridge.js:145-150`), so a slash-free string can never collide with
+ * a real `provider/model` — the route itself is never parsed back out of this.
+ */
+const CUSTOM_MODEL_OPTION = '__custom__'
+
+/** View of the catalogue before the first answer: the panel stays usable. */
+const MODEL_CATALOG_LOADING = Object.freeze({ phase: 'loading', groups: [], defaultRoute: '' })
+
+/** In-flight / settled `session.modelCatalog()` read, shared by every mount. */
+let modelCatalogCache = null
+
+/** Last settled view, so a remount renders the list instead of the spinner. */
+let modelCatalogView = null
+
+/**
+ * The `session` namespace of the Client `remote` service, or `null`.
+ *
+ * `modelCatalog()` is the built-in model picker's own source: a zero-argument
+ * `direct` Remote (`dsh-api-session-controller/src/index.ts:343-346`, wire
+ * descriptor `lib/typert.host.js:2201`), so no host route and no `inject`
+ * declaration is needed (research: `notes/model-catalog.md` §1.1, §3).
+ *
+ * Probed through `clientService()` for the reason documented there: a plain
+ * `ctx.session` read throws for an undeclared name and would roll the panel
+ * back. `remote.session` itself is a plain namespace object.
+ *
+ * @param {object | null | undefined} ctx - Cordis client context.
+ * @returns {{ modelCatalog: Function } | null} the namespace, or `null`.
+ */
+function modelCatalogRemote(ctx) {
+  const remote = clientService(ctx, 'remote')
+  if (remote === null || typeof remote !== 'object') return null
+  let session
+  try {
+    session = remote.session
+  } catch {
+    return null
+  }
+  if (session === null || typeof session !== 'object') return null
+  return typeof session.modelCatalog === 'function' ? session : null
+}
+
+/**
+ * Localised text of an `LlmModelBadge`.
+ *
+ * The wire type is `{ text: string | localized map, tone }`. The platform's
+ * built-in picker resolves the map through its own translator; this bundle has
+ * no such binding, so a plain string wins and a map falls back to zh then en.
+ *
+ * @param {unknown} badge - `ModelCatalogModel.badge`.
+ * @returns {string} the badge text, or `''`.
+ */
+function modelBadgeText(badge) {
+  if (badge === null || typeof badge !== 'object') return ''
+  const text = badge.text
+  if (typeof text === 'string') return text.trim()
+  if (text === null || typeof text !== 'object') return ''
+  for (const locale of ['zh', 'en']) {
+    const entry = text[locale]
+    if (typeof entry === 'string' && entry.trim() !== '') return entry.trim()
+  }
+  return ''
+}
+
+/**
+ * Flatten a `ModelCatalog` into the panel's option groups.
+ *
+ * `ModelProviderGroup` is `{ id, name, models }` (`dsh-api-session-controller/
+ * src/types.ts:120-132`): **`groups[].id` is the provider id**, which is why the
+ * option value is `${group.providerId ?? group.id}/${model.id}`. The route is
+ * joined once and handed to the Host whole — the pipeline's `parseRoute` splits
+ * on the *first* slash (`src/host/bridge.js:145-150`), so a model id that itself
+ * contains slashes survives intact.
+ *
+ * @param {unknown} value - `ModelCatalog` from the Remote.
+ * @returns {{ groups: object[], defaultRoute: string } | null} view, or null.
+ */
+function readModelCatalog(value) {
+  if (value === null || typeof value !== 'object') return null
+  const rawGroups = Array.isArray(value.groups) ? value.groups : []
+  const groups = []
+  for (const group of rawGroups) {
+    if (group === null || typeof group !== 'object') continue
+    const provider = typeof group.providerId === 'string' && group.providerId !== ''
+      ? group.providerId
+      : (typeof group.id === 'string' ? group.id : '')
+    if (provider === '') continue
+    const rawModels = Array.isArray(group.models) ? group.models : []
+    const models = []
+    for (const model of rawModels) {
+      if (model === null || typeof model !== 'object') continue
+      const id = typeof model.id === 'string' ? model.id : ''
+      if (id === '') continue
+      const name = typeof model.name === 'string' && model.name.trim() !== '' ? model.name : id
+      const badge = modelBadgeText(model.badge)
+      models.push({
+        id,
+        route: `${provider}/${id}`,
+        // `model.name` first, then the id; the badge is an annotation on it.
+        label: badge === '' ? name : `${name} · ${badge}`,
+        description: typeof model.description === 'string' ? model.description : '',
+      })
+    }
+    // The host drops empty groups too (`catalog.ts:65-66`); keep that invariant.
+    if (models.length === 0) continue
+    groups.push({
+      id: provider,
+      name: typeof group.name === 'string' && group.name.trim() !== '' ? group.name : provider,
+      models,
+    })
+  }
+  const fallback = value.default
+  const defaultRoute = fallback !== null && typeof fallback === 'object'
+    && typeof fallback.provider === 'string' && fallback.provider !== ''
+    && typeof fallback.model === 'string' && fallback.model !== ''
+    ? `${fallback.provider}/${fallback.model}`
+    : ''
+  return { groups, defaultRoute }
+}
+
+/**
+ * One `session.modelCatalog()` read, normalised for the panel.
+ *
+ * Every failure mode collapses into a view instead of a rejection: the catalogue
+ * is only routable providers, so "no credentials" is an ordinary state, and the
+ * panel must fall back to the text input rather than lose the advanced block.
+ *
+ * @param {object | null | undefined} ctx - Cordis client context.
+ * @returns {Promise<{ phase: string, groups: object[], defaultRoute: string }>} view.
+ */
+async function fetchModelCatalog(ctx) {
+  const api = modelCatalogRemote(ctx)
+  if (api === null) return { phase: 'failed', groups: [], defaultRoute: '' }
+  try {
+    // RemoteResult: `{ ok: true, value }` / `{ ok: false, error }`.
+    const catalog = readModelCatalog(remoteValue(await api.modelCatalog(), 'model catalog unavailable'))
+    if (catalog === null || catalog.groups.length === 0) {
+      return { phase: 'empty', groups: [], defaultRoute: '' }
+    }
+    return { phase: 'ready', groups: catalog.groups, defaultRoute: catalog.defaultRoute }
+  } catch {
+    return { phase: 'failed', groups: [], defaultRoute: '' }
+  }
+}
+
+/**
+ * Read the catalogue at most once per page, and never twice concurrently.
+ *
+ * Only a settled answer is cached: a failure is forgotten so the next panel
+ * mount retries (credentials may have been configured in between).
+ *
+ * @param {object | null | undefined} ctx - Cordis client context.
+ * @returns {Promise<{ phase: string, groups: object[], defaultRoute: string }>} view.
+ */
+function loadModelCatalog(ctx) {
+  if (modelCatalogCache !== null) return modelCatalogCache
+  modelCatalogCache = fetchModelCatalog(ctx).then((view) => {
+    if (view.phase === 'failed') modelCatalogCache = null
+    else modelCatalogView = view
+    return view
+  })
+  return modelCatalogCache
+}
+
+/** Strip trailing path separators, keeping a root (`/`, `C:\`) whole. */
+function trimTrailingSeparators(text) {
+  let end = text.length
+  while (end > 1 && (text[end - 1] === '\\' || text[end - 1] === '/')) end -= 1
+  // 'C:\' must not collapse to 'C:', which names the drive's current directory.
+  if (end === 2 && /^[A-Za-z]:$/.test(text.slice(0, 2))) return text.slice(0, 3)
+  return text.slice(0, end)
+}
+
+/**
+ * Parent of a path, using whichever separator the platform wrote.
+ *
+ * @param {string} text - a path with or without trailing separators.
+ * @returns {string} the parent, or `''` when there is none to name.
+ */
+function parentDirectory(text) {
+  const trimmed = trimTrailingSeparators(text)
+  if (trimmed === '') return ''
+  const cut = Math.max(trimmed.lastIndexOf('\\'), trimmed.lastIndexOf('/'))
+  if (cut < 0) return ''
+  if (cut === 0) return trimmed.slice(0, 1)
+  // 'C:\x' has the drive root as its parent, not 'C:'.
+  if (cut === 2 && /^[A-Za-z]:$/.test(trimmed.slice(0, 2))) return trimmed.slice(0, 3)
+  return trimmed.slice(0, cut)
+}
+
+/**
+ * Directory the in-app picker starts in for one typed path.
+ *
+ * @param {string} input - the panel's current path field.
+ * @returns {string} a directory, or `''` to let the Host list the home directory.
+ */
+function startDirectoryOf(input) {
+  const text = typeof input === 'string' ? input.trim() : ''
+  if (text === '') return ''
+  if (/[\\/]$/.test(text)) return trimTrailingSeparators(text)
+  return parentDirectory(text)
+}
+
+/**
+ * Whether one listing row names a file rather than a directory.
+ *
+ * The `browse` backend reports **directories only** (its `list` skips every
+ * dirent that is neither a directory nor a symlink to one), so no row it sends
+ * carries a kind. Rows are therefore directories unless the wire says
+ * otherwise; a backend that ever reports files is honoured through `type` /
+ * `isDirectory`, and the caller then keeps just the `.pdf` ones.
+ *
+ * @param {object} entry - one `DirectoryEntry` from a listing.
+ * @returns {boolean} true for a file row.
+ */
+function entryIsFile(entry) {
+  if (typeof entry.type === 'string') return entry.type === 'file'
+  if (typeof entry.isDirectory === 'boolean') return entry.isDirectory === false
+  return false
+}
+
+/**
+ * Normalise one listing into picker rows: directories, then `.pdf` files.
+ *
+ * @param {unknown} listing - the `DirectoryListing` the Host answered.
+ * @returns {{ path: string, up: string, entries: Array<{ name: string, path: string, isFile: boolean }> }} rows plus the parent target.
+ */
+function listingView(listing) {
+  const source = listing !== null && typeof listing === 'object' ? listing : {}
+  const path = typeof source.path === 'string' ? source.path : ''
+  const directories = []
+  const files = []
+  const rows = Array.isArray(source.entries) ? source.entries : []
+  for (const entry of rows) {
+    if (entry === null || typeof entry !== 'object') continue
+    const name = typeof entry.name === 'string' ? entry.name : ''
+    const target = typeof entry.path === 'string' ? entry.path : ''
+    if (name === '' || target === '') continue
+    if (entryIsFile(entry)) {
+      if (!PDF_SUFFIX_RE.test(name)) continue
+      files.push({ name, path: target, isFile: true })
+      continue
+    }
+    directories.push({ name, path: target, isFile: false })
+  }
+  const byName = (left, right) => left.name.localeCompare(right.name)
+  directories.sort(byName)
+  files.sort(byName)
+  // The ancestry the Host ships is the reliable "up": it is rooted at the real
+  // filesystem root, which no string operation on the listed path can be sure of.
+  const crumbs = Array.isArray(source.crumbs) ? source.crumbs : []
+  const above = crumbs.length >= 2 ? crumbs[crumbs.length - 2] : null
+  const parent = above !== null && typeof above === 'object' && typeof above.path === 'string' && above.path !== ''
+    ? above.path
+    : parentDirectory(path)
+  // A filesystem root has no parent to offer: the Host's chain stops there, and
+  // a computed parent of the root is the root itself.
+  const up = parent === path ? '' : parent
+  return { path, up, entries: directories.concat(files) }
+}
+
 /**
  * Fetch and prepare one `.epub` for the reading area.
  *
@@ -1893,11 +2355,23 @@ loader.load({
       'panel.advanced': '高级',
       'panel.model': '模型',
       'panel.modelHint': '留空则使用插件配置的默认模型',
+      'panel.modelCustom': '自定义…',
+      'panel.modelFallback': '无法读取模型清单，请手动填写 provider/model',
+      'panel.modelLoading': '正在读取模型清单…',
+      'panel.modelEmpty': '没有可用模型，请手动填写 provider/model',
       'panel.reviewModels': '复核模型',
       'panel.reviewModelsHint': 'provider/model，多个用逗号分隔；留空则不做交叉复核',
       'panel.dpi': 'DPI',
       'panel.concurrency': '并发',
       'panel.retry': '重试',
+      'panel.browse': '浏览…',
+      'picker.title': '选择 PDF 文件',
+      'picker.loading': '正在读取目录…',
+      'picker.up': '上级目录',
+      'picker.empty': '这个目录里没有子目录或 PDF',
+      'picker.cancel': '取消',
+      'picker.unavailable': '当前环境无法打开文件选择器，请手动输入绝对路径',
+      'picker.notPdf': '只能选择 .pdf 文件',
       'status.idle': '等待中',
       'status.queued': '排队中',
       'status.rendering': '渲染页面',
@@ -1947,11 +2421,23 @@ loader.load({
       'panel.advanced': 'Advanced',
       'panel.model': 'Model',
       'panel.modelHint': 'Leave empty to use the default model from the plugin configuration',
+      'panel.modelCustom': 'Custom…',
+      'panel.modelFallback': 'The model catalog is unavailable; type provider/model',
+      'panel.modelLoading': 'Loading models…',
+      'panel.modelEmpty': 'No models available; type provider/model',
       'panel.reviewModels': 'Review models',
       'panel.reviewModelsHint': 'provider/model ids separated by commas; leave empty to skip cross-review',
       'panel.dpi': 'DPI',
       'panel.concurrency': 'Concurrency',
       'panel.retry': 'Retry',
+      'panel.browse': 'Browse…',
+      'picker.title': 'Choose a PDF',
+      'picker.loading': 'Reading the folder…',
+      'picker.up': 'Parent folder',
+      'picker.empty': 'No subfolders or PDFs here',
+      'picker.cancel': 'Cancel',
+      'picker.unavailable': 'This environment cannot open a file chooser; type the absolute path instead',
+      'picker.notPdf': 'Only .pdf files can be chosen',
       'status.idle': 'Idle',
       'status.queued': 'Queued',
       'status.rendering': 'Rendering page',
@@ -2070,6 +2556,32 @@ loader.load({
       font: 'inherit',
       fontSize: 13,
       lineHeight: 1.4,
+    }
+
+    /** One row of the in-app picker: full width, left aligned, name folded. */
+    const browserRowStyle = {
+      display: 'block',
+      width: '100%',
+      textAlign: 'left',
+      padding: '6px 8px',
+      borderRadius: 6,
+      border: '1px solid transparent',
+      background: 'transparent',
+      color: 'var(--dsw-alias-label-primary, inherit)',
+      font: 'inherit',
+      fontSize: 13,
+      lineHeight: 1.5,
+      cursor: 'pointer',
+      whiteSpace: 'nowrap',
+      overflow: 'hidden',
+      textOverflow: 'ellipsis',
+    }
+
+    /** Loading / empty / error copy inside the picker. */
+    const browserMessageStyle = {
+      padding: '14px 10px',
+      fontSize: 12,
+      color: 'var(--dsw-alias-label-tertiary, inherit)',
     }
 
     /**
@@ -2317,9 +2829,10 @@ loader.load({
      * translate function reads the locale at call time.
      *
      * @param {(key: string, params?: Record<string, unknown>) => string} t - localised copy.
+     * @param {object} ctx - Cordis client context (the browse flow reads `ctx.remote`).
      * @returns {Function} the panel component.
      */
-    function createPanel(t) {
+    function createPanel(t, ctx) {
       /** Status text for a phase, falling back to the raw phase name. */
       const phaseLabel = (phase) => {
         const key = PHASE_COPY[phase] ?? `status.${phase}`
@@ -2338,7 +2851,10 @@ loader.load({
         const [path, setPath] = React.useState(() => retained.path)
         const [advancedOpen, setAdvancedOpen] = React.useState(false)
         const [model, setModel] = React.useState('')
-        const [reviewModels, setReviewModels] = React.useState('')
+        // The 「复核模型」 field was removed from the panel, but the hook stays so
+        // every slot below keeps its index (the harness reads them by number).
+        // The value is the pipeline's own default: cross-review off.
+        const [reviewModels] = React.useState(() => [])
         const [dpi, setDpi] = React.useState('')
         const [concurrency, setConcurrency] = React.useState('')
         const [job, setJob] = React.useState(() => retained.job)
@@ -2357,6 +2873,17 @@ loader.load({
         const rootRef = React.useRef(null)
         const contentRef = React.useRef(null)
         const bookLoadRef = React.useRef('')
+        // Browsing hooks stay below every pre-existing slot: the recorded
+        // useState/useRef order is the panel's public seam for the harness
+        // checks (path is slot 0, theme 18), so new hooks are only ever appended.
+        const pathInputRef = React.useRef(null)
+        const browseLoadRef = React.useRef(null)
+        const [browse, setBrowse] = React.useState(null)
+        const [browseError, setBrowseError] = React.useState(null)
+        // Model-catalogue hooks are appended for the same reason: a new slot is
+        // only ever added after every existing one.
+        const [modelSource, setModelSource] = React.useState('catalog')
+        const [modelCatalog, setModelCatalog] = React.useState(() => modelCatalogView ?? MODEL_CATALOG_LOADING)
 
         // Keep the retained snapshot in sync so a panel switch loses nothing.
         React.useEffect(() => {
@@ -2370,8 +2897,26 @@ loader.load({
         }, [path, job, book, bookPath, bookError, activeChapter, readerVisible])
 
         // Theme aliases are probed once; the var() form keeps them live.
+        //
+        // The model catalogue rides on this mount-once effect instead of a
+        // seventh `useEffect`: `client-check.mjs` asserts the panel's effect
+        // count and the slot order behind it, and the catalogue is read once per
+        // mount anyway (the module-level cache dedupes a remount).
         React.useEffect(() => {
           setTheme(pickThemeTokens(rootRef.current))
+          let cancelled = false
+          void loadModelCatalog(ctx).then((view) => {
+            if (cancelled) return
+            setModelCatalog(view)
+            // The catalogue's own default is the dropdown's initial selection;
+            // a route the operator already typed or picked always wins.
+            if (view.defaultRoute !== '') {
+              setModel((current) => (current === '' ? view.defaultRoute : current))
+            }
+          })
+          return () => {
+            cancelled = true
+          }
         }, [])
 
         const phase = job === null ? 'idle' : job.phase
@@ -2548,10 +3093,10 @@ loader.load({
           try {
             // `input` is the Host's field name (`src/host/server.js#parseSpec`);
             // omitted optional keys fall back to the plugin configuration.
+            // `reviewModels` is deliberately absent: the panel no longer edits
+            // it, and the pipeline's own default is the empty array.
             const payload = { input }
             if (model.trim() !== '') payload.model = model.trim()
-            const reviews = parseModels(reviewModels)
-            if (reviews.length > 0) payload.reviewModels = reviews
             const dpiValue = parseInteger(dpi)
             if (dpiValue !== undefined) payload.dpi = dpiValue
             const concurrencyValue = parseInteger(concurrency)
@@ -2595,6 +3140,122 @@ loader.load({
           if (jobError !== null && !running) void start()
         }
 
+        /* ------------------------------------------------- browsing for a PDF */
+
+        /** Put the caret back in the path field once a chooser closed. */
+        const focusPathInput = () => {
+          const node = pathInputRef.current
+          if (node === null || node === undefined) return
+          if (typeof node.focus !== 'function') return
+          try {
+            node.focus()
+          } catch {
+            // A detached node cannot take focus; the path is still correct.
+          }
+        }
+
+        /** Adopt one absolute path chosen by either flow. */
+        const applyChosenPath = (chosen) => {
+          setPath(chosen)
+          setBrowseError(null)
+          focusPathInput()
+        }
+
+        /** Close the in-app picker, abandoning a listing still in flight. */
+        const closeBrowser = () => {
+          const controller = browseLoadRef.current
+          browseLoadRef.current = null
+          if (controller !== null && controller !== undefined && typeof controller.abort === 'function') controller.abort()
+          setBrowse(null)
+          focusPathInput()
+        }
+
+        /**
+         * Read one directory level into the picker.
+         *
+         * A path of `''` asks the Host for its home directory: the browse
+         * backend documents "absent lists the home directory", so an empty
+         * field still opens somewhere real instead of at a guessed location.
+         *
+         * @param {string} target - absolute directory, or `''` for the host's home.
+         */
+        const loadDirectory = async (target) => {
+          const previous = browseLoadRef.current
+          browseLoadRef.current = null
+          if (previous !== null && previous !== undefined && typeof previous.abort === 'function') previous.abort()
+          const controller = typeof AbortController === 'function' ? new AbortController() : null
+          const signal = controller === null ? undefined : controller.signal
+          browseLoadRef.current = controller
+          setBrowse({ phase: 'loading', path: target, up: '', entries: [], error: null })
+          const picker = directoryPickerRemote(ctx)
+          if (picker === null) {
+            browseLoadRef.current = null
+            setBrowse({ phase: 'error', path: target, up: '', entries: [], error: new Error(t('picker.unavailable')) })
+            return
+          }
+          try {
+            const answer = target === '' ? picker.list(undefined, signal) : picker.list(target, signal)
+            const listing = remoteValue(await answer, t('picker.unavailable'))
+            if (browseLoadRef.current !== controller) return
+            const view = listingView(listing)
+            setBrowse({
+              phase: 'ready',
+              path: view.path === '' ? target : view.path,
+              up: view.up,
+              entries: view.entries,
+              error: null,
+            })
+          } catch (error) {
+            if (browseLoadRef.current !== controller) return
+            if (error !== null && typeof error === 'object' && error.name === 'AbortError') return
+            setBrowse({ phase: 'error', path: target, up: '', entries: [], error })
+          } finally {
+            if (browseLoadRef.current === controller) browseLoadRef.current = null
+          }
+        }
+
+        /**
+         * 「浏览…」: the platform's file chooser first, the in-app picker after.
+         *
+         * The Desktop chooser is preferred because it is the real OS "Open"
+         * dialog with a `.pdf` filter and it returns the absolute path directly.
+         * Everything else — a plain browser tab, a Host whose bridge cannot map
+         * the picked file — falls through to the in-app browser, which needs no
+         * Desktop at all.
+         */
+        const handleBrowse = async () => {
+          setBrowseError(null)
+          const bridge = desktopPathBridge()
+          if (bridge !== null) {
+            const chooser = choosePdfWithDesktopBridge(bridge, rootRef.current)
+            if (chooser !== null) {
+              const outcome = await chooser
+              if (outcome !== null && outcome.ok === true) {
+                // The filter is a hint the dialog lets the operator override
+                // ("All files"), so the suffix is checked here as well.
+                if (!PDF_SUFFIX_RE.test(outcome.path)) {
+                  setBrowseError(new Error(t('picker.notPdf')))
+                  focusPathInput()
+                  return
+                }
+                applyChosenPath(outcome.path)
+                return
+              }
+              // A cancel is the operator's decision, never an error: the typed
+              // path stays exactly as it was and the caret comes back.
+              if (outcome !== null && outcome.reason === 'cancelled') {
+                focusPathInput()
+                return
+              }
+            }
+          }
+          if (directoryPickerRemote(ctx) === null) {
+            setBrowseError(new Error(t('picker.unavailable')))
+            return
+          }
+          await loadDirectory(startDirectoryOf(path))
+        }
+
         const retryLabel = t('panel.retry')
         const startDisabled = path.trim() === '' || submitting || running
         const startLabel = job !== null && !running ? 'panel.rerun' : 'panel.start'
@@ -2627,6 +3288,243 @@ loader.load({
           }),
         )
 
+        /**
+         * The 「模型」 control of the advanced block.
+         *
+         * A `<select>` built from `session.modelCatalog()` whenever that list can
+         * be read, and the original text input whenever it cannot. The catalogue
+         * only holds routes that are routable *right now* (no credentials means
+         * no group at all), so it is never a closed list: 「自定义…」 — and any
+         * value the catalogue does not know — falls back to free text, which is
+         * what the Host's `model` field tolerates.
+         *
+         * `model` stays the single source of truth: whichever control was
+         * touched last owns it, and `modelSource` only records which one that
+         * was, so the dropdown and the text box can never disagree.
+         *
+         * @returns {object} React element.
+         */
+        const modelField = () => {
+          const ready = modelCatalog.phase === 'ready' && modelCatalog.groups.length > 0
+          const routes = new Set()
+          if (ready) {
+            for (const group of modelCatalog.groups) {
+              for (const entry of group.models) routes.add(entry.route)
+            }
+          }
+          // A value the catalogue does not list (typed by hand, or restored from
+          // a stale selection) lands on 「自定义…」 rather than on a `select` that
+          // has no matching option.
+          const customActive = ready && (modelSource === 'custom' || (model !== '' && !routes.has(model)))
+          const note = ready
+            ? ''
+            : modelCatalog.phase === 'loading'
+              ? t('panel.modelLoading')
+              : modelCatalog.phase === 'empty'
+                ? t('panel.modelEmpty')
+                : t('panel.modelFallback')
+
+          /** Free-text route input: the fallback, and the 「自定义…」 editor. */
+          const routeInput = () => h('input', {
+            key: 'route',
+            type: 'text',
+            value: model,
+            placeholder: t('panel.modelHint'),
+            spellCheck: false,
+            autoComplete: 'off',
+            'aria-label': t('panel.model'),
+            onChange: (event) => {
+              // Typing always wins: this control now owns the value.
+              setModelSource('custom')
+              setModel(event.target.value)
+            },
+            style: { ...inputStyle, flex: 'initial', width: '100%' },
+          })
+
+          const control = ready
+            ? h(
+              'select',
+              {
+                key: 'select',
+                value: customActive ? CUSTOM_MODEL_OPTION : model,
+                'aria-label': t('panel.model'),
+                onChange: (event) => {
+                  const value = String(event.target.value)
+                  if (value === CUSTOM_MODEL_OPTION) {
+                    // Keep the current text so it stays editable.
+                    setModelSource('custom')
+                    return
+                  }
+                  setModelSource('catalog')
+                  setModel(value)
+                },
+                style: { ...inputStyle, flex: 'initial', width: '100%' },
+              },
+              // Empty value: no per-call model, i.e. the plugin configuration.
+              h('option', { key: 'catalog-default', value: '' }, t('panel.modelHint')),
+              modelCatalog.groups.map(group => h(
+                'optgroup',
+                { key: group.id, label: group.name },
+                group.models.map(entry => h(
+                  'option',
+                  {
+                    key: entry.route,
+                    value: entry.route,
+                    title: entry.description === '' ? undefined : entry.description,
+                  },
+                  entry.label,
+                )),
+              )),
+              h('option', { key: 'catalog-custom', value: CUSTOM_MODEL_OPTION }, t('panel.modelCustom')),
+            )
+            : routeInput()
+
+          const children = [
+            h('span', {
+              key: 'label',
+              style: { fontSize: 12, color: 'var(--dsw-alias-label-secondary, inherit)' },
+            }, t('panel.model')),
+            control,
+          ]
+          if (ready && customActive) children.push(routeInput())
+          if (note !== '') {
+            children.push(h('span', {
+              key: 'note',
+              style: { fontSize: 11, color: 'var(--dsw-alias-label-tertiary, inherit)' },
+            }, note))
+          }
+          return h(
+            'label',
+            { style: { display: 'flex', flexDirection: 'column', gap: 4, minWidth: 0 } },
+            children,
+          )
+        }
+
+        /**
+         * The in-app picker overlay, or `null` while it is closed.
+         *
+         * Built from `browse` alone, so the loading, error, empty and ready
+         * states are one render path. Rows are `button`s: a directory row
+         * descends, a `.pdf` row picks the file and closes the overlay.
+         *
+         * @returns {object | null} React element, or `null` when closed.
+         */
+        const browseOverlay = () => {
+          if (browse === null) return null
+          const rows = []
+          if (typeof browse.up === 'string' && browse.up !== '') {
+            rows.push(h(
+              'button',
+              {
+                key: 'up',
+                type: 'button',
+                onClick: () => { void loadDirectory(browse.up) },
+                style: { ...browserRowStyle, color: 'var(--dsw-alias-label-secondary, inherit)' },
+              },
+              `↑ ${t('picker.up')}`,
+            ))
+          }
+          for (const entry of browse.entries) {
+            rows.push(h(
+              'button',
+              {
+                key: entry.path,
+                type: 'button',
+                title: entry.path,
+                onClick: () => {
+                  // A picked file ends the whole flow: close first (which also
+                  // returns focus), then adopt the path.
+                  if (entry.isFile) {
+                    closeBrowser()
+                    applyChosenPath(entry.path)
+                    return
+                  }
+                  void loadDirectory(entry.path)
+                },
+                style: browserRowStyle,
+              },
+              // A trailing separator reads as "this is a folder" without an icon.
+              entry.isFile ? entry.name : `${entry.name}/`,
+            ))
+          }
+          const body = browse.phase === 'loading'
+            ? h('div', { style: browserMessageStyle }, t('picker.loading'))
+            : browse.phase === 'error'
+              ? h('div', { style: { ...browserMessageStyle, color: 'var(--dsw-alias-state-error-primary, #c0392b)' } }, messageOf(browse.error))
+              : rows.length === 0
+                ? h('div', { style: browserMessageStyle }, t('picker.empty'))
+                : rows
+          return h(
+            'div',
+            {
+              style: {
+                position: 'absolute',
+                inset: 0,
+                zIndex: 20,
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'center',
+                padding: 16,
+                background: 'var(--dsw-alias-bg-mask, rgba(0, 0, 0, 0.32))',
+              },
+            },
+            h(
+              'div',
+              {
+                role: 'dialog',
+                'aria-modal': true,
+                'aria-label': t('picker.title'),
+                style: {
+                  display: 'flex',
+                  flexDirection: 'column',
+                  width: '100%',
+                  maxWidth: 520,
+                  maxHeight: '100%',
+                  borderRadius: 10,
+                  border: '1px solid var(--dsw-alias-border-l2, rgba(0, 0, 0, 0.12))',
+                  background: 'var(--dsw-alias-bg-base, inherit)',
+                  boxShadow: '0 12px 40px rgba(0, 0, 0, 0.24)',
+                  overflow: 'hidden',
+                },
+              },
+              h(
+                'div',
+                {
+                  style: {
+                    display: 'flex',
+                    alignItems: 'center',
+                    gap: 8,
+                    padding: '10px 12px',
+                    borderBottom: '1px solid var(--dsw-alias-border-l2, rgba(0, 0, 0, 0.08))',
+                  },
+                },
+                h('div', { style: { flex: 1, minWidth: 0, fontSize: 13, fontWeight: 600 } }, t('picker.title')),
+                h('button', { type: 'button', onClick: closeBrowser, style: ghostButtonStyle(false) }, t('picker.cancel')),
+              ),
+              h(
+                'div',
+                {
+                  title: browse.path,
+                  style: {
+                    padding: '6px 12px',
+                    fontSize: 11,
+                    color: 'var(--dsw-alias-label-tertiary, inherit)',
+                    whiteSpace: 'nowrap',
+                    overflow: 'hidden',
+                    textOverflow: 'ellipsis',
+                  },
+                },
+                browse.path === '' ? '~' : browse.path,
+              ),
+              h(
+                'div',
+                { style: { flex: '1 1 auto', minHeight: 96, overflowY: 'auto', padding: '2px 6px 10px' } },
+                body,
+              ),
+            ),
+          )
+        }
+
         return h(
           'div',
           {
@@ -2638,6 +3536,9 @@ loader.load({
               height: '100%',
               minHeight: 0,
               overflow: 'hidden',
+              // The in-app picker is absolutely positioned inside this box, so
+              // it can never escape the panel or need a document-level portal.
+              position: 'relative',
               color: 'var(--dsw-alias-label-primary, inherit)',
               background: 'var(--dsw-alias-bg-base, inherit)',
               fontSize: 14,
@@ -2666,6 +3567,7 @@ loader.load({
               { style: { display: 'flex', gap: 8, alignItems: 'center' } },
               h('input', {
                 type: 'text',
+                ref: pathInputRef,
                 value: path,
                 placeholder: t('panel.inputPath'),
                 spellCheck: false,
@@ -2684,6 +3586,19 @@ loader.load({
                 'button',
                 {
                   type: 'button',
+                  // Never disabled: picking the first file is exactly when the
+                  // field is still empty.
+                  onClick: () => { void handleBrowse() },
+                  title: t('panel.browse'),
+                  'aria-label': t('panel.browse'),
+                  style: { ...buttonStyle(false), flex: '0 0 auto' },
+                },
+                t('panel.browse'),
+              ),
+              h(
+                'button',
+                {
+                  type: 'button',
                   onClick: () => { void start() },
                   disabled: startDisabled,
                   style: primaryButtonStyle(startDisabled),
@@ -2691,6 +3606,16 @@ loader.load({
                 t(startLabel),
               ),
             ),
+            browseError === null
+              ? null
+              : h(
+                'div',
+                {
+                  role: 'alert',
+                  style: { marginTop: 6, fontSize: 12, color: 'var(--dsw-alias-state-error-primary, #c0392b)' },
+                },
+                messageOf(browseError),
+              ),
             h(
               'button',
               {
@@ -2705,8 +3630,7 @@ loader.load({
               ? h(
                 'div',
                 { style: { display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(160px, 1fr))', gap: 10, marginTop: 8 } },
-                advancedField(t('panel.model'), model, setModel, t('panel.modelHint')),
-                advancedField(t('panel.reviewModels'), reviewModels, setReviewModels, t('panel.reviewModelsHint')),
+                modelField(),
                 advancedField(t('panel.dpi'), dpi, setDpi, '150'),
                 advancedField(t('panel.concurrency'), concurrency, setConcurrency, '4'),
               )
@@ -2916,6 +3840,11 @@ loader.load({
                 : null,
             ),
           }),
+
+          /* ---- D. in-app file picker ----------------------------------- */
+          // Absolutely positioned inside the panel root: no portal, no
+          // document-level node, so the picker dies with the panel.
+          browseOverlay(),
         )
       }
 
@@ -3305,7 +4234,7 @@ loader.load({
         return fallback === undefined ? key : fillParams(fallback, params)
       }
 
-      const Panel = createPanel(t)
+      const Panel = createPanel(t, ctx)
 
       // `main` first: clicking the sidebar entry runs `layout.selectPanel(id)`,
       // which throws while no main entry carries that key.

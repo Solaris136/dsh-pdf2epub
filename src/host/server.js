@@ -10,9 +10,14 @@
  *  - The webserver hands only GET/HEAD to a `resource`; a POST has to be the
  *    Node-style `handler`. The starter is therefore the one handler route and
  *    the four readers are resources.
- *  - `ctx.jobs.start` wants `run` to return its hooks synchronously and `done`
- *    never to reject, so a failed conversion is folded into an outcome after it
- *    has been written to the state table.
+ *  - A job is process-local. A registered route is unowned, so the `jobs`
+ *    service — whose controller is bound to one agent — is not reachable from
+ *    it; `ctx.jobs.start` therefore failed every real click with "no job
+ *    controller serves this agent". {@link startConversionJob} mints its own
+ *    id and drives the conversion against this module's own state table
+ *    instead: it returns synchronously, the run settles the record, and a
+ *    failure is folded into that record rather than escaping as an unhandled
+ *    rejection that would take the process down.
  *  - The two file readers serve only the artifacts this plugin produced (see
  *    {@link producedArtifacts}); the suffix whitelist is a second gate, not the
  *    access decision, so a caller cannot read an arbitrary EPUB from disk.
@@ -32,8 +37,10 @@
  */
 
 import { unzipSync } from 'fflate'
+import { randomUUID } from 'node:crypto'
 import { readFile, stat } from 'node:fs/promises'
 import path from 'node:path'
+import { fileURLToPath } from 'node:url'
 
 /** The five exact route paths this plugin owns. */
 export const ROUTE_PATHS = Object.freeze({
@@ -60,8 +67,8 @@ const FILE_SUFFIXES = Object.freeze([ARTIFACT_MEDIA.epub.suffix, ARTIFACT_MEDIA.
 /** The one suffix `GET /book` serves: the JSON chapter list the reading view renders. */
 const BOOK_SUFFIXES = Object.freeze([ARTIFACT_MEDIA.book.suffix])
 
-/** Producer kind; the registry stamps ids as `pdf2epub-<short-uuid>`. */
-const JOB_KIND = 'pdf2epub'
+/** Prefix every job id {@link startConversionJob} mints carries. */
+const JOB_ID_PREFIX = 'pdf2epub'
 
 /** Largest `POST /run` body accepted, in bytes. */
 const MAX_BODY_BYTES = 256 * 1024
@@ -98,6 +105,17 @@ const CONTENT_SUFFIX_RE = /\.x?html?$/i
 const MAX_ARTIFACTS = 200
 
 /**
+ * Job records kept in {@link states} before the oldest settled one is dropped.
+ *
+ * A settled record is only ever polled some more, so losing the oldest one costs
+ * nothing — but nothing used to drop them, and a long-lived host that starts a
+ * conversion per click grew the table without bound (review finding S5). Active
+ * records are never evicted, so the table can pass the cap while more than this
+ * many conversions run at once; it comes back under the cap as they settle.
+ */
+const MAX_STATES = 50
+
+/**
  * Absolute paths of the files this plugin produced, oldest first.
  *
  * The two file readers refuse everything else: the routes are reachable from a
@@ -111,12 +129,13 @@ const MAX_ARTIFACTS = 200
 const producedArtifacts = new Map()
 
 /**
- * Live state of every started job, keyed by the registry-issued id.
+ * Live state of every started job, keyed by the id {@link startConversionJob}
+ * minted.
  *
  * Module scope on purpose: `POST /run` writes here while `GET /state` reads
  * (the tool converts inline and keeps no state), and concurrent jobs stay
- * isolated by key. Entries are kept after settlement so a late poll still reads
- * the terminal state.
+ * isolated by key. Settled entries are kept so a late poll still reads the
+ * terminal state, under the {@link MAX_STATES} cap.
  *
  * @type {Map<string, object>}
  */
@@ -126,27 +145,131 @@ const states = new Map()
 /* Conversion                                                                */
 /* -------------------------------------------------------------------------- */
 
-/** Cached dynamic import of the conversion pipeline. */
-let pipelineLoad
+/**
+ * Absolute URL of the conversion pipeline, resolved against this module.
+ *
+ * Kept as a `URL` rather than a path: {@link loadPipeline} appends a version
+ * query to `href`, and the result has to stay a valid module specifier on every
+ * platform (a raw Windows path would need escaping first).
+ *
+ * That query also decides whether the pipeline's own submodules are re-read:
+ * their import specifiers carry `?v=<LOCAL_MODULE_VERSION>` (see
+ * `src/pipeline.js`), and those URLs are only seen when the pipeline module
+ * itself is evaluated again. The file's mtime cannot express "only the
+ * submodules changed", which is why the second stamp below exists.
+ */
+const PIPELINE_URL = new URL('../pipeline.js', import.meta.url)
 
 /**
- * Load the conversion pipeline on first use.
+ * Manual API stamp mixed into the pipeline's cache-bust query, next to the mtime.
+ *
+ * WHY: the mtime query re-evaluates `pipeline.js` when THAT file changes, but its
+ * submodules are separate URLs and are only re-read because `pipeline.js` is
+ * evaluated again and resolves them afresh. Change `model/assemble.js`,
+ * `epub/build.js` or `host/bridge.js`, bump `LOCAL_MODULE_VERSION` in
+ * `src/pipeline.js`, reload the plugin — and `pipeline.js` is byte-for-byte
+ * unchanged, so the mtime query is identical, the loader hands back the module
+ * it already has, and the new submodule URLs are never resolved. This constant
+ * makes the loader's URL move when that stamp does, which is what lets the two
+ * levels bust independently: mtime covers the pipeline body, the API version
+ * covers "a submodule changed but the entry file did not".
+ *
+ * WHEN TO BUMP: in the same edit as `LOCAL_MODULE_VERSION` in `src/pipeline.js` —
+ * the two numbers are one fact written twice — and therefore whenever any file
+ * under `src/model/`, `src/epub/`, `src/pdf/` or `src/host/` changes. Bumping it
+ * on its own is harmless: it costs one re-evaluation of the pipeline.
+ *
+ * Both this and the mtime are a development / hot-reload convenience, not a
+ * shipping mechanism. Every reloaded revision stays in the ESM cache for the
+ * life of the process, so a release still has to be verified after restarting
+ * the host.
+ */
+const PIPELINE_API_VERSION = 1
+
+/** Composed cache-bust stamp (`<mtime>-<PIPELINE_API_VERSION>`) the module below was loaded with; `undefined` until a load succeeds. */
+let pipelineVersion
+
+/** Namespace of the pipeline module as last loaded, or `undefined` before the first load. */
+let pipelineModule
+
+/**
+ * Load the conversion pipeline, re-evaluating it whenever its file changed.
  *
  * Deferred instead of imported at module load so registering the tool and the
  * routes never depends on the pipeline's native dependencies (mupdf is a WASM
  * module that initialises on import). A load failure therefore surfaces on the
  * first conversion, inside the caller's own error handling, rather than through
- * the host's plugin loader. The promise is cached and cleared again on failure,
- * so a repaired install converts without restarting the host.
+ * the host's plugin loader. Nothing is cached on failure, so a repaired install
+ * converts without restarting the host.
  *
- * @returns {Promise<{ runConversion: (options: object) => Promise<object> }>} the pipeline module.
+ * WHY THE MTIME QUERY — Node's ESM cache is process-wide and keyed by URL, and a
+ * plugin reload (`plugin_manager set_plugin` false then true) only re-evaluates
+ * `index.js` and this file. `pipeline.js` was already imported once, so it keeps
+ * running the copy from the FIRST load forever: editing it and reloading changed
+ * nothing, and a conversion kept replaying the old pipeline down to a
+ * byte-identical report. Appending the file's own modification time to the URL
+ * gives an edited file a new module identity, so an edit takes effect on the next
+ * conversion without restarting the host.
+ *
+ * WHY THE SECOND STAMP — the mtime says nothing about the pipeline's own
+ * `import`s. Those carry a manual `?v=` (see `LOCAL_MODULE_VERSION` in
+ * `src/pipeline.js`) and only take effect when this loader hands out a NEW
+ * pipeline module; with `pipeline.js` untouched the mtime query is unchanged and
+ * the old module — old submodules included — is returned. The API version below
+ * is therefore part of the query as well, so bumping it after a submodule-only
+ * change forces that re-evaluation. The two halves bust independently: mtime for
+ * the pipeline body, API version for the graph below it.
+ *
+ * The stamp is the file's mtime, never `Date.now()`: a per-call query would mint
+ * a fresh URL on every call and rebuild the pipeline's module-level state each
+ * time. An unchanged file (and an unchanged API version) keeps one URL, hence
+ * one module object. This whole scheme is a development convenience — a released
+ * version should still be verified after a host restart, and every reloaded
+ * revision stays in the ESM cache for the life of the process.
+ *
+ * One `stat` runs per call (microseconds) and the module is cached against the
+ * composed stamp, so an untouched install pays a stat plus a compare and nothing
+ * else. A failed `stat` is not treated as fatal: the plain URL is imported so a
+ * real load error is thrown as-is instead of being masked by this helper. That
+ * plain URL is also the one reason a load can land outside the stamp table: a
+ * missing file has no mtime to name it with.
+ *
+ * Exported so the `.out` checks can pin this behaviour without running a
+ * conversion: a changed stamp must load a new module object, an unchanged one
+ * must reuse the module already loaded.
+ *
+ * @returns {Promise<{ runConversion: (options: object) => Promise<object>, PROMPT_VERSION: number }>} the pipeline module of its current revision.
  */
-function loadPipeline() {
-  pipelineLoad ??= import('../pipeline.js').catch((error) => {
-    pipelineLoad = undefined
-    throw error
-  })
-  return pipelineLoad
+export async function loadPipeline() {
+  const version = await pipelineStamp()
+  if (version === undefined) return import(PIPELINE_URL.href)
+  const stamp = `${version}-${PIPELINE_API_VERSION}`
+  if (pipelineModule !== undefined && stamp === pipelineVersion) return pipelineModule
+  const loaded = await import(`${PIPELINE_URL.href}?v=${stamp}`)
+  pipelineVersion = stamp
+  pipelineModule = loaded
+  return loaded
+}
+
+/**
+ * The pipeline file's modification time, truncated to whole milliseconds.
+ *
+ * `mtimeMs` is fractional on some filesystems, and any change of the file has to
+ * show up as a different stamp, so it is truncated to an integer before it
+ * becomes a URL: two reads of one untouched file then agree exactly. `undefined`
+ * means "no usable stamp" — the path is missing, is not a regular file, or
+ * `stat` failed — which sends {@link loadPipeline} down its uncached
+ * plain-import path.
+ *
+ * @returns {Promise<number | undefined>} a millisecond stamp, or `undefined`.
+ */
+async function pipelineStamp() {
+  try {
+    const info = await stat(fileURLToPath(PIPELINE_URL))
+    return info.isFile() ? Math.trunc(info.mtimeMs) : undefined
+  } catch {
+    return undefined
+  }
 }
 
 /**
@@ -189,6 +312,20 @@ export function parseSpec(input) {
   if (args.reviewModels !== undefined) spec.reviewModels = requireStringArray(args.reviewModels, 'reviewModels')
   for (const key of ['dpi', 'maxTokens', 'concurrency', 'splitLevel']) {
     if (args[key] !== undefined) spec[key] = requireNumber(args[key], key)
+  }
+  /* Page selection and metadata overrides: only the type is checked here. The
+   * page expression's grammar and its bounds against the real page count belong
+   * to the pipeline (`parsePageList` / `resolvePageSelection`), and a blank
+   * title/author/publisher means "keep the PDF's own metadata", so an empty
+   * string is passed through instead of being refused here. */
+  for (const key of ['pages', 'excludePages', 'title', 'author', 'publisher']) {
+    if (args[key] === undefined) continue
+    if (typeof args[key] !== 'string') throw new Error(`pdf2epub: "${key}" must be a string`)
+    spec[key] = args[key]
+  }
+  if (args.cover !== undefined) {
+    if (typeof args.cover !== 'boolean') throw new Error('pdf2epub: "cover" must be a boolean')
+    spec.cover = args.cover
   }
   if (args.force !== undefined) {
     if (typeof args.force !== 'boolean') throw new Error('pdf2epub: "force" must be a boolean')
@@ -282,96 +419,193 @@ async function finalizeConversion(result) {
 }
 
 /* -------------------------------------------------------------------------- */
-/* Jobs                                                                      */
+/* Conversion runner                                                         */
 /* -------------------------------------------------------------------------- */
 
 /**
- * Start one conversion as a background job.
+ * Runs one conversion to its canonical value.
  *
- * @param {object} ctx - plugin context carrying `jobs`, `llm`, `attachments`.
+ * Module-level and replaceable so `test/harness/host-check.mjs` can drive both
+ * outcomes of the executor without a vision model: pass a function to
+ * {@link setConversionRunner}, and pass nothing to put the real pipeline back.
+ * Nothing else ever changes it, so the shipped path always calls
+ * {@link convertToCanonical} — which imports `runConversion` from
+ * `src/pipeline.js` on first use.
+ *
+ * @type {(ctx: object, config: object, spec: object, options: { onProgress?: (event: object) => void }) => Promise<object>}
+ */
+let conversionRunner = convertToCanonical
+
+/**
+ * Replace the conversion runner (test seam).
+ *
+ * @param {((ctx: object, config: object, spec: object, options: { onProgress?: (event: object) => void }) => Promise<object>) | null | undefined} runner - the replacement, or nothing to restore the real pipeline.
+ * @returns {void}
+ */
+export function setConversionRunner(runner) {
+  conversionRunner = typeof runner === 'function' ? runner : convertToCanonical
+}
+
+/* -------------------------------------------------------------------------- */
+/* Jobs                                                                      */
+/* -------------------------------------------------------------------------- */
+
+/** Job phases that never change again: a settled record is what a late poll reads. */
+const TERMINAL_PHASES = new Set(['done', 'failed', 'cancelled'])
+
+/**
+ * Whether one phase is settled.
+ *
+ * @param {unknown} phase - job phase.
+ * @returns {boolean} true when nothing will move the record again.
+ */
+function isTerminalPhase(phase) {
+  return TERMINAL_PHASES.has(String(phase))
+}
+
+/**
+ * Mint one job id.
+ *
+ * `randomUUID` rather than a counter: two routes starting a conversion in the
+ * same tick must not collide, and the id is only ever an opaque key.
+ *
+ * @returns {string} job id, `pdf2epub-<uuid>`.
+ */
+function newJobId() {
+  return `${JOB_ID_PREFIX}-${randomUUID()}`
+}
+
+/**
+ * Drop the oldest settled records until the table fits {@link MAX_STATES}.
+ *
+ * Insertion order is creation order, so the first matching keys are the oldest.
+ * A running record is skipped — a poller may still be watching it — which means
+ * the table can stay above the cap while more than that many conversions run,
+ * and comes back under it as they settle.
+ *
+ * @returns {void}
+ */
+function pruneStates() {
+  if (states.size <= MAX_STATES) return
+  for (const [jobId, state] of states) {
+    if (states.size <= MAX_STATES) return
+    if (isTerminalPhase(state.phase)) states.delete(jobId)
+  }
+}
+
+/**
+ * Start one conversion and return at once.
+ *
+ * The record is written before this returns, so the `{ jobId }` a caller gets
+ * back can be polled immediately. Everything after that point is asynchronous:
+ * the conversion runs against this module's own state table — no `jobs` service
+ * is involved, which is what makes the route work on an unowned HTTP request —
+ * and its outcome is folded into that table by {@link executeJob}.
+ *
+ * A conversion problem is the job's outcome, never this call's error, so this
+ * does not throw for one. The route still wraps it in a try/catch for the
+ * runtime faults a `randomUUID` could raise.
+ *
+ * @param {object} ctx - plugin context carrying `llm` and `attachments`.
  * @param {object} config - normalized plugin configuration.
  * @param {object} spec - validated spec (see {@link parseSpec}).
- * @returns {string} the registry-issued job id.
- * @throws when the registry refuses to start a job (no controller, owner gone).
+ * @returns {{ jobId: string }} id `GET /state` accepts.
  */
 export function startConversionJob(ctx, config, spec) {
-  const jobId = ctx.jobs.start({
-    kind: JOB_KIND,
-    label: `pdf2epub ${path.basename(spec.input)}`,
-    run: (job) => {
-      const state = createState(job.id, spec)
-      states.set(state.jobId, state)
-      const controller = new AbortController()
-      let finished = false
-      /** @type {string | undefined} */
-      let killReason
+  const jobId = newJobId()
+  const state = createState(jobId, spec)
+  states.set(jobId, state)
+  pruneStates()
+  // Deliberately not awaited: the route answers with the id immediately, and
+  // `executeJob` handles its own failure. The extra catch is the last seatbelt —
+  // an unexpected throw in that error path must not become an unhandled
+  // rejection, which would take the host process down.
+  void executeJob(ctx, config, spec, state).catch(() => {})
+  return { jobId }
+}
 
-      const done = (async () => {
-        try {
-          job.append(`converting ${spec.input}\n`)
-          const canonical = await convertToCanonical(ctx, config, spec, {
-            signal: controller.signal,
-            onProgress: event => applyProgress(state, event, job),
-          })
-          finished = true
-          Object.assign(state, {
-            phase: 'done',
-            status: 'completed',
-            page: canonical.pages,
-            total: canonical.pages,
-            tokens: canonical.tokens,
-            epubPath: canonical.epubPath,
-            reportPath: canonical.reportPath,
-            bookJsonPath: canonical.bookJsonPath,
-            updatedAt: Date.now(),
-          })
-          recordArtifacts(state.jobId, canonical)
-          job.updateProgress('done')
-          job.append(`wrote ${canonical.epubPath} (${canonical.chapters} chapters, ${canonical.degradedPages} degraded page(s))\n`)
-          return { status: /** @type {const} */ ('completed') }
-        } catch (error) {
-          finished = true
-          const message = errorMessage(error)
-          if (killReason !== undefined) {
-            state.phase = 'cancelled'
-            state.status = 'killed'
-            state.updatedAt = Date.now()
-            job.append(`cancelled: ${killReason}\n`)
-            return { status: /** @type {const} */ ('killed'), detail: killReason }
-          }
-          // Never let a conversion failure escape `done`: the registry records
-          // the outcome, and the process keeps running for the other jobs.
-          state.phase = 'failed'
-          state.status = 'failed'
-          state.error = message
-          state.updatedAt = Date.now()
-          job.append(`failed: ${message}\n`)
-          return { status: /** @type {const} */ ('failed'), detail: message }
-        }
-      })()
+/**
+ * Run one job to completion and fold its outcome into its record.
+ *
+ * @param {object} ctx - plugin context carrying `llm` and `attachments`.
+ * @param {object} config - normalized plugin configuration.
+ * @param {object} spec - validated spec.
+ * @param {object} state - mutable record in {@link states}.
+ * @returns {Promise<void>} resolves once the record is settled.
+ */
+async function executeJob(ctx, config, spec, state) {
+  try {
+    const canonical = await conversionRunner(ctx, config, spec, {
+      onProgress: event => applyProgress(state, event),
+    })
+    settleCompleted(state, canonical)
+    // Only a conversion that returned its three files is registered; a failure
+    // throws before this line, exactly as the tool path does.
+    recordArtifacts(state.jobId, canonical)
+  } catch (error) {
+    settleFailed(state, error)
+  } finally {
+    pruneStates()
+  }
+}
 
-      return {
-        cancel(reason) {
-          if (finished) return
-          killReason = reason ?? 'cancelled'
-          state.status = 'stopping'
-          controller.abort()
-        },
-        done,
-      }
-    },
-  })
-  return String(jobId)
+/**
+ * Move one record to its successful terminal state.
+ *
+ * @param {object} state - mutable record.
+ * @param {object} canonical - canonical conversion value.
+ * @returns {void}
+ */
+function settleCompleted(state, canonical) {
+  const pages = wholeNumber(canonical?.pages, state.total)
+  state.phase = 'done'
+  state.status = 'completed'
+  state.page = pages
+  state.total = pages
+  state.tokens = {
+    input: wholeNumber(canonical?.tokens?.input),
+    output: wholeNumber(canonical?.tokens?.output),
+    total: wholeNumber(canonical?.tokens?.total),
+  }
+  if (typeof canonical?.epubPath === 'string') state.epubPath = canonical.epubPath
+  if (typeof canonical?.reportPath === 'string') state.reportPath = canonical.reportPath
+  if (typeof canonical?.bookJsonPath === 'string') state.bookJsonPath = canonical.bookJsonPath
+  state.error = null
+  state.updatedAt = Date.now()
+}
+
+/**
+ * Move one record to its failed terminal state.
+ *
+ * The message is kept verbatim so the panel can show what the pipeline said (a
+ * missing PDF, a model that takes no image, a refused write) instead of a
+ * generic failure. Nothing is registered as an artifact.
+ *
+ * @param {object} state - mutable record.
+ * @param {unknown} error - thrown value.
+ * @returns {void}
+ */
+function settleFailed(state, error) {
+  state.phase = 'failed'
+  state.status = 'failed'
+  state.error = errorMessage(error)
+  state.updatedAt = Date.now()
 }
 
 /**
  * Create the state record for one starting job.
  *
- * @param {string} jobId - registry-issued id.
+ * Written before `POST /run` answers, so the first poll already sees a queued
+ * record under a running status. `pageStatus` is the last per-page verdict the
+ * pipeline reported (`ok`, `cached`, `reviewed`, `degraded`); it is kept apart
+ * from `status`, which is this layer's job lifecycle.
+ *
+ * @param {string} jobId - id minted by {@link startConversionJob}.
  * @param {object} spec - validated spec.
  * @returns {object} mutable state record (internal columns included).
  */
 function createState(jobId, spec) {
+  const now = Date.now()
   return {
     jobId: String(jobId),
     input: spec.input,
@@ -379,12 +613,14 @@ function createState(jobId, spec) {
     page: 0,
     total: 0,
     status: 'running',
+    pageStatus: null,
     tokens: { input: null, output: null, total: 0 },
     epubPath: null,
     reportPath: null,
     bookJsonPath: null,
     error: null,
-    updatedAt: Date.now(),
+    createdAt: now,
+    updatedAt: now,
   }
 }
 
@@ -392,21 +628,29 @@ function createState(jobId, spec) {
  * Fold one pipeline progress event into a job's state record.
  *
  * Phases are the pipeline's own (`start`, `page`, `assemble`, `done`) plus
- * `failed` / `cancelled` from this layer. `tokens.total` is the pipeline's
- * running count; the input/output split only exists once the report is written.
+ * `failed` from this layer. `tokens.total` is the pipeline's running count; the
+ * input/output split only exists once the report is written.
+ *
+ * The event's own `status` is the page's verdict (`ok`, `cached`, `reviewed`,
+ * `degraded`), not the job's, so it lands in `pageStatus`; `status` stays the
+ * lifecycle value (`running` until {@link executeJob} settles it) and a reader
+ * of `/state` never sees a page verdict standing in for it.
+ *
+ * A settled record is never moved again: a straggling event from a run that has
+ * already failed must not reopen it.
  *
  * @param {object} state - mutable state record.
  * @param {object} event - progress event from `runConversion`.
- * @param {{ updateProgress?: (line: string) => void }} [job] - producer face, for the live progress line.
  * @returns {void}
  */
-function applyProgress(state, event, job) {
-  const phase = event?.phase
+function applyProgress(state, event) {
+  if (isTerminalPhase(state.phase)) return
   state.updatedAt = Date.now()
+  if (typeof event?.status === 'string' && event.status !== '') state.pageStatus = event.status
+  const phase = event?.phase
   if (phase === 'start') {
     state.phase = 'start'
     state.total = wholeNumber(event.pages, state.total)
-    job?.updateProgress?.(`0/${state.total}`)
     return
   }
   if (phase === 'page') {
@@ -414,12 +658,10 @@ function applyProgress(state, event, job) {
     state.page = wholeNumber(event.page, state.page)
     state.total = wholeNumber(event.total, state.total)
     state.tokens = { ...state.tokens, total: wholeNumber(event.tokens, state.tokens.total) }
-    job?.updateProgress?.(`${state.page}/${state.total}`)
     return
   }
   if (phase === 'assemble') {
     state.phase = 'assemble'
-    job?.updateProgress?.('assembling')
     return
   }
   if (phase === 'done') {
@@ -434,7 +676,7 @@ function applyProgress(state, event, job) {
  * The public state projection of one job.
  *
  * @param {string} jobId - id returned by `POST /run`.
- * @returns {{ jobId: string, phase: string, page: number, total: number, status: string, tokens: { input: number | null, output: number | null, total: number }, epubPath: string | null, reportPath: string | null, bookJsonPath: string | null, error: string | null } | undefined} projection, or `undefined` for an unknown id.
+ * @returns {{ jobId: string, phase: string, page: number, total: number, status: string, pageStatus: string | null, tokens: { input: number | null, output: number | null, total: number }, epubPath: string | null, reportPath: string | null, bookJsonPath: string | null, error: string | null, createdAt: number } | undefined} projection, or `undefined` for an unknown id.
  */
 export function readJobState(jobId) {
   const state = states.get(String(jobId))
@@ -445,6 +687,7 @@ export function readJobState(jobId) {
     page: state.page,
     total: state.total,
     status: state.status,
+    pageStatus: state.pageStatus,
     tokens: {
       input: state.tokens.input,
       output: state.tokens.output,
@@ -454,7 +697,21 @@ export function readJobState(jobId) {
     reportPath: state.reportPath,
     bookJsonPath: state.bookJsonPath,
     error: state.error,
+    createdAt: state.createdAt,
   }
+}
+
+/**
+ * How many job records the table holds (diagnostics and tests).
+ *
+ * `GET /state` answers for one id and cannot describe the table, so the cap
+ * on it is observable only through this counter — it reports the bound
+ * {@link pruneStates} enforces, nothing else.
+ *
+ * @returns {number} live record count.
+ */
+export function stateCount() {
+  return states.size
 }
 
 /* -------------------------------------------------------------------------- */
@@ -519,7 +776,7 @@ export function recordArtifacts(jobId, canonical) {
  * the reading view and holds a workspace-relative path rather than an absolute
  * one; see {@link resolveEpubPath}.
  *
- * @param {object} ctx - plugin context carrying `webServer`, `connection`, `jobs`, `llm`, `attachments`.
+ * @param {object} ctx - plugin context carrying `webServer`, `connection`, `llm`, `attachments`.
  * @param {object} config - normalized plugin configuration.
  * @returns {void}
  */
@@ -650,7 +907,9 @@ export function registerRoutes(ctx, config) {
         return
       }
       try {
-        sendNodeJson(response, 200, { jobId: startConversionJob(ctx, config, spec) })
+        // The executor answers with the id and finishes on its own; a conversion
+        // that goes wrong is written to the state table, not reported here.
+        sendNodeJson(response, 200, startConversionJob(ctx, config, spec))
       } catch (error) {
         sendNodeJson(response, 500, { error: `cannot start a pdf2epub job: ${errorMessage(error)}` })
       }

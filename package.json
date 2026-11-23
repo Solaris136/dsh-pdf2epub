@@ -31,7 +31,11 @@
   "scripts": {
     "pretest": "node src/pdf/smoke.mjs",
     "test": "node src/model/test.mjs && node src/epub/test.mjs && node src/epub/hardening.test.mjs && node test/e2e.mjs",
-    "test:harness": "node test/harness/host-check.mjs && node test/harness/epub-route-check.mjs && node test/harness/client-check.mjs && node test/harness/locale-check.mjs && node test/harness/preview-check.mjs && node test/harness/route-path.mjs && node test/harness/security-check.mjs && node test/harness/model-select-check.mjs && node test/harness/picker-check.mjs"
+    "test:harness": "node test/harness/host-check.mjs && node test/harness/epub-route-check.mjs && node test/harness/client-check.mjs && node test/harness/locale-check.mjs && node test/harness/preview-check.mjs && node test/harness/route-path.mjs && node test/harness/security-check.mjs && node test/harness/model-select-check.mjs && node test/harness/picker-check.mjs",
+    "check:syntax": "node test/ci/check-static.mjs",
+    "check:package": "node test/ci/check-package.mjs",
+    "check": "npm run check:syntax && npm run check:package",
+    "ci": "npm run check && npm test && npm run test:harness"
   },
   "dsh": {
     "bundle": {

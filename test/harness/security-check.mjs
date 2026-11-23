@@ -264,14 +264,32 @@ if (sample === undefined) {
 /* 2. browser layer                                                           */
 /* -------------------------------------------------------------------------- */
 
-const EDGE_CANDIDATES = [
+// Browser discovery is deliberately wider than one machine: the Windows paths
+// are what a developer usually has, the Linux/macOS paths are what the hosted
+// CI images ship. `PDF2EPUB_REQUIRE_BROWSER=1` (CI) turns "no binary" into a
+// failure so the real-parser layer cannot quietly disappear from the gate.
+const BROWSER_CANDIDATES = [
+  process.env.PDF2EPUB_CHROMIUM,
   'C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe',
   'C:/Program Files/Microsoft/Edge/Application/msedge.exe',
   'C:/Program Files/Google/Chrome/Application/chrome.exe',
-]
-const browser = EDGE_CANDIDATES.find(candidate => fs.existsSync(candidate))
+  '/usr/bin/google-chrome',
+  '/usr/bin/google-chrome-stable',
+  '/opt/google/chrome/chrome',
+  '/usr/bin/chromium',
+  '/usr/bin/chromium-browser',
+  '/snap/bin/chromium',
+  '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
+  '/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge',
+].filter(candidate => typeof candidate === 'string' && candidate !== '')
+const browser = BROWSER_CANDIDATES.find(candidate => fs.existsSync(candidate))
+const requireBrowser = process.env.PDF2EPUB_REQUIRE_BROWSER === '1'
 
-if (browser === undefined) {
+if (browser === undefined && requireBrowser) {
+  failures.push('browser layer required')
+  console.log('\n== 2. browser layer FAILED: PDF2EPUB_REQUIRE_BROWSER=1 but no Chrome/Chromium/Edge was found ==')
+  console.log(`      looked at:\n${BROWSER_CANDIDATES.map(candidate => `      - ${candidate}`).join('\n')}`)
+} else if (browser === undefined) {
   console.log('\n== 2. browser layer SKIPPED: no Edge/Chrome found ==')
 } else {
   const strippedCases = CASES.map(([label, html]) => ({ label: label.slice(0, 4).trim(), html: stripActiveMarkup(html) }))
@@ -320,7 +338,7 @@ setTimeout(inspect, 1500);
     '--disable-extensions',
     '--virtual-time-budget=4000',
     '--dump-dom',
-    `file:///${pagePath.replaceAll('\\', '/')}`,
+    pathToFileURL(pagePath).href,
   ], { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 })
 
   const rows = []
